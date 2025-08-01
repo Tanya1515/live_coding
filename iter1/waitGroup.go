@@ -37,8 +37,8 @@ func (wg *WaitGroup) Wait() {
 }
 
 func (wg *WaitGroup) Done() {
-	atomic.AddInt32(&wg.GoroutinesCount, -1)
-	if atomic.CompareAndSwapInt32(&wg.GoroutinesCount, -1, 0) {
+
+	if atomic.AddInt32(&wg.GoroutinesCount, -1) == -1 {
 		panic("Error: Invalid goroutines count")
 	} else if atomic.LoadInt32(&wg.GoroutinesCount) == 0 {
 		select {
