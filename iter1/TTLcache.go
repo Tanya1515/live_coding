@@ -19,43 +19,51 @@ type CacheItem struct {
 type ConcurrentTTLCache struct {
 	cacheMap map[string]CacheItem
 	// RWMutex
-	cacheMutex *sync.Mutex
-	chanStop chan struct{}
+	cacheMutex *sync.RWMutex
+	chanStop   chan struct{}
 }
 
 func NewConcurrentTTLCache() *ConcurrentTTLCache {
-	var mutex sync.Mutex
 	cache := make(map[string]CacheItem, 10)
 	chanStop := make(chan struct{})
 
 	cacheTTL := &ConcurrentTTLCache{
-		cacheMutex: &mutex,
-		cacheMap: cache,
+		cacheMutex: &sync.RWMutex{},
+		cacheMap:   cache,
 	}
 	go func(cacheTTL *ConcurrentTTLCache) {
-		ticker := time.NewTicker(2 *time.Second)
+		ticker := time.NewTicker(2 * time.Second)
 		for {
 			select {
-			case <- ticker.C: 
-				// RLock
-				// пройтись по всей мапе и достать кандидатов на удаление
-				// RUnlock
+			case <-ticker.C:
+				ElementsToRemove := make(map[string]struct{}, len(cacheTTL.cacheMap))
+				cacheTTL.cacheMutex.RLock()
+				for key, value := range cacheTTL.cacheMap {
+					if !value.expiry.After(time.Now()) {
+						ElementsToRemove[key] = struct{}{}
+					}
+				}
+				cacheTTL.cacheMutex.RUnlock()
 
-				// Проходимся по кандидатм на удаление и под Lock-ом на запись выполняем проверку, что элемент не поменялся и чистим
-
+				for key := range ElementsToRemove {
+					cacheTTL.cacheMutex.Lock()
+					value, _ := cacheTTL.cacheMap[key]
+					if !value.expiry.After(time.Now()) {
+						delete(cacheTTL.cacheMap, key)
+					}
+					cacheTTL.cacheMutex.Unlock()
+				}
 
 				for key, value := range cacheTTL.cacheMap {
-					// в RLock лучше только получение, затем еще раз проверить внутри lock-а на запись, 
-					// что значение не поменялось
 					cacheTTL.cacheMutex.Lock()
 					if !value.expiry.After(time.Now()) {
 						delete(cacheTTL.cacheMap, key)
 					}
 					cacheTTL.cacheMutex.Unlock()
 				}
-			case <- chanStop: 
+			case <-chanStop:
 				ticker.Stop()
-				return 
+				return
 			}
 		}
 	}(cacheTTL)
@@ -64,31 +72,30 @@ func NewConcurrentTTLCache() *ConcurrentTTLCache {
 }
 
 func (c *ConcurrentTTLCache) Set(key string, value interface{}, ttl time.Duration) {
-	
+
 	timeToExpire := time.Now().Add(ttl)
 	c.cacheMutex.Lock()
 	defer c.cacheMutex.Unlock()
 
 	c.cacheMap[key] = CacheItem{value: value, expiry: timeToExpire}
-	return 
+	return
 }
 
 func (c *ConcurrentTTLCache) Get(key string) (interface{}, bool) {
-	// Mutex -> RWMutex, 
-	c.cacheMutex.Lock()
+	c.cacheMutex.RLock()
 	value, exists := c.cacheMap[key]
-	c.cacheMutex.Unlock()
+	c.cacheMutex.RUnlock()
 
 	if !exists {
 		return nil, false
-	} 
+	}
 
 	if !value.expiry.After(time.Now()) {
 		return nil, false
 	}
 
 	return value.value, true
-	
+
 }
 
 func (c *ConcurrentTTLCache) Stop() {

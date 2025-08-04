@@ -5,7 +5,7 @@ import (
 )
 
 // Задача: реализовать WaitGroup на базе каналов
-// Спросить, есть ли требования 
+//
 
 type WaitGroup struct {
 	GoroutinesCount int32
@@ -28,6 +28,7 @@ func (wg *WaitGroup) Add(amount uint32) {
 func (wg *WaitGroup) Wait() {
 
 	for {
+		// Пустой канал нужен, чтобы не греть процессор, поскольку бесконечный цикл забирает один процессор
 		<-wg.Channel
 		if atomic.LoadInt32(&wg.GoroutinesCount) == 0 {
 			return
@@ -37,7 +38,7 @@ func (wg *WaitGroup) Wait() {
 
 func (wg *WaitGroup) Done() error {
 	count := atomic.AddInt32(&wg.GoroutinesCount, -1)
-	// так горутина будет работать с фиксированным count, которое меняться не будет в рамках одной горутины
+	// Горутина будет работать с фиксированным count, которое меняться не будет в рамках одной горутины
 	if count == -1 {
 		panic("Invalid goroutines count")
 	} else if count == 0 {
