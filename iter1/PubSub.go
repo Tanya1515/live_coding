@@ -11,6 +11,8 @@ package main
 // 	Publish(topic string, msg interface{})
 // }
 
+// На следующий раз
+
 import _ "sync"
 
 type PubSub struct {
@@ -32,4 +34,8 @@ func (ps *PubSub) Unsubscribe(topic string, ch <-chan interface{}) {
 
 func (ps *PubSub) Publish(topic string, msg interface{}) {
 	//
+}
+
+func (ps *PubSub) Close() {
+
 }

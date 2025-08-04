@@ -17,7 +17,7 @@ type WorkerPool struct {
 
 func NewWorkerPool(maxWorkers int) *WorkerPool {
 	if maxWorkers <= 0 {
-		return nil
+		return &WorkerPool{}
 	}
 	var wg sync.WaitGroup
 	countChannel := make(chan struct{}, maxWorkers)

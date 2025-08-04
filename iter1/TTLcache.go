@@ -18,6 +18,7 @@ type CacheItem struct {
 
 type ConcurrentTTLCache struct {
 	cacheMap map[string]CacheItem
+	// RWMutex
 	cacheMutex *sync.Mutex
 	chanStop chan struct{}
 }
@@ -36,12 +37,21 @@ func NewConcurrentTTLCache() *ConcurrentTTLCache {
 		for {
 			select {
 			case <- ticker.C: 
+				// RLock
+				// пройтись по всей мапе и достать кандидатов на удаление
+				// RUnlock
+
+				// Проходимся по кандидатм на удаление и под Lock-ом на запись выполняем проверку, что элемент не поменялся и чистим
+
+
 				for key, value := range cacheTTL.cacheMap {
+					// в RLock лучше только получение, затем еще раз проверить внутри lock-а на запись, 
+					// что значение не поменялось
+					cacheTTL.cacheMutex.Lock()
 					if !value.expiry.After(time.Now()) {
-						cacheTTL.cacheMutex.Lock()
 						delete(cacheTTL.cacheMap, key)
-						cacheTTL.cacheMutex.Unlock()
 					}
+					cacheTTL.cacheMutex.Unlock()
 				}
 			case <- chanStop: 
 				ticker.Stop()
@@ -64,18 +74,21 @@ func (c *ConcurrentTTLCache) Set(key string, value interface{}, ttl time.Duratio
 }
 
 func (c *ConcurrentTTLCache) Get(key string) (interface{}, bool) {
+	// Mutex -> RWMutex, 
 	c.cacheMutex.Lock()
-	defer c.cacheMutex.Unlock()
+	value, exists := c.cacheMap[key]
+	c.cacheMutex.Unlock()
 
-	// очистка?
-	if value, exists := c.cacheMap[key]; exists {
-		if !value.expiry.After(time.Now()) {
-			delete(c.cacheMap, key)
-		} else {
-			return value.value, true
-		}
+	if !exists {
+		return nil, false
+	} 
+
+	if !value.expiry.After(time.Now()) {
+		return nil, false
 	}
-	return nil, false
+
+	return value.value, true
+	
 }
 
 func (c *ConcurrentTTLCache) Stop() {

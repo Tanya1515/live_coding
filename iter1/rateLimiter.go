@@ -19,11 +19,12 @@ type RateLimiter struct {
 
 func NewRateLimiter(rate int, interval time.Duration) *RateLimiter {
 	// валидация значений (возможно, не нужна)
+	// вернуть RateLimiter с пустыми значениями
 	if rate <= 0 {
-		return nil
+		return &RateLimiter{}
 	}
 	if interval <= 0 {
-		return nil
+		return &RateLimiter{}
 	}
 	stopChannel := make(chan struct{})
 	rateLimiter := &RateLimiter{

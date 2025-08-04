@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // Задача: Создайте конвейер (pipeline), где каждый этап обрабатывает данные и
 // может возвращать ошибку. Реализуйте функцию RunPipeline(stages ...Stage),
@@ -22,6 +25,9 @@ import "fmt"
 type Stage func(in <-chan int) (<-chan int, error)
 
 func RunPipeline(stages ...Stage) ([]int, error) {
+	if len(stages) == 0 {
+		return nil, errors.New("Incorrect amount of stages")
+	}
 	inputChan := make(chan int)
 	result := make([]int, 0)
 
@@ -93,7 +99,12 @@ func main() {
 		return out, nil
 	}
 
-	result, err := RunPipeline(Stage1, Stage2, Stage3)
+	stages := make([]Stage, 0)
+	stages = append(stages, Stage1)
+	stages = append(stages, Stage2)
+	stages = append(stages, Stage3)
+
+	result, err := RunPipeline(stages...)
 	if err != nil {
 		fmt.Println(err)
 		return
