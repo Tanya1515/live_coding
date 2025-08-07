@@ -10,6 +10,47 @@ import (
 // Создайте структуру RateLimiter, которая ограничивает количество вызовов функции
 // в указанный промежуток времени (например, не более 5 вызовов в секунду).
 
+/*
+
+Альтернативное решение:
+
+import "time"
+
+type RateLimitChecker interface {
+ CheckRateLimit() bool
+
+ C() <-chan time.Time
+}
+
+func NewRateLimiter(period time.Duration, rateLimit int) *RateLimiter {
+ return &RateLimiter{
+  period:    period,
+  rateLimit: rateLimit,
+  ticker:    time.NewTicker(period / time.Duration(rateLimit)),
+ }
+}
+
+type RateLimiter struct {
+ period    time.Duration
+ ticker    *time.Ticker
+ rateLimit int
+}
+
+func (rl *RateLimiter) CheckRateLimit() bool {
+ select {
+ case <-rl.ticker.C:
+  return true
+ default:
+  return false
+ }
+}
+
+func (rl *RateLimiter) C() <-chan time.Time {
+ return rl.ticker.C
+}
+
+*/
+
 type RateLimiter struct {
 	Rate              int
 	Interval          time.Duration
@@ -18,12 +59,11 @@ type RateLimiter struct {
 }
 
 func NewRateLimiter(rate int, interval time.Duration) *RateLimiter {
-	// валидация значений (возможно, не нужна)
 	if rate <= 0 {
-		return nil
+		return &RateLimiter{}
 	}
 	if interval <= 0 {
-		return nil
+		return &RateLimiter{}
 	}
 	stopChannel := make(chan struct{})
 	rateLimiter := &RateLimiter{
