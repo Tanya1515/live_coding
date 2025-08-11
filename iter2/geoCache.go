@@ -20,7 +20,8 @@ import (
 
 2) Потокобезопасный доступ к разным партициям
 
-3) Оптимальный поиск по радиусу (не перебирать все точки)
+3) Оптимальный поиск по радиусу (не перебирать все точки) - разделить на квадраты + посмотреть на 
+сторону  квадрату < радиуса и посмотреть на точки, которые попадают
 
 4) TTL-based инвалидация
 
@@ -73,22 +74,37 @@ func NewGeoCahche() *GeoCacheEx {
 		mu:      &sync.RWMutex{},
 	}
 
-	go geoCache.Cleanup(time.Now())
-
 	return geoCache
 }
 
+func geoHashDecode(geoHash string) GeoPoint {
+	/*
+	1) Каждую букву из Base32 необходимо преобразовать в последовательность из 5 битов
+	2) Затем поочередном обходим массив, если четная позиция - долгота, нечетная позиция - широта. 
+	3) В зависимости от значения бита - выбираем, к какому диапозону относится точка и делим его пополам.
+	4) В цикле обхим биты и вычисляем примерные координаты geohash
+	5) Возвращаем итоговую координату. 
+	*/
+	return GeoPoint{}
+} 
+
 func geoHashCode(point GeoPoint) string {
-	// как вычислять geoHash??
+	/*
+	1) определяем границы по широте и долготе: [-90, 90] и [-180, 180] соответсвенно
+	2) Делим каждый из диапозонов пополам, для широты: [-90, 0] и [0, 90], например. 
+	3) Если координата по широте находится в дипозоне [-90, 0] - записываем 0, 
+	в диапозоне [0, 90] - записываем 1. 
+	4) Аналогично для долготы. 
+	5) Диапозон сужается и алгоритм повторяется, начиная с 3его пункта.
+	6) Собираем результирующий массив: на четные позиции записываются биты долготы, на нечетные - биты широты. 
+	7) Биты в результирующем массиве разбиваются по 5 бит и кодируются в Base32: 0123456789bcdefghjkmnpqrstuvwxyz 
+	*/
 	return ""
 }
 
 func (gc *GeoCacheEx) Set(point GeoPoint, item CacheItem) error {
-	// 1) Выислить geohash
 
 	hashPoint := geoHashCode(point)
-
-	// 2) Добавить в мапу по hash-у под мьютексом
 
 	gc.mu.Lock()
 	if _, exists := gc.hashMap[hashPoint]; !exists {
@@ -101,12 +117,29 @@ func (gc *GeoCacheEx) Set(point GeoPoint, item CacheItem) error {
 	return nil
 }
 
+
+
 func (gc *GeoCacheEx) GetInRadius(center GeoPoint, radius float64) (map[GeoPoint]CacheItem, error) {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	result := make(map[GeoPoint]CacheItem, 10)
 
-	// 1) Итерируемся по GeoPoint, прибавляя каждый раз радиус. (Непонятно, какая дельта используется)
-	// 2) На каждой итерации под RLock-ом читаем данные из кэша и сохраняем в возвращаемую мапу
-	return nil, nil
+	gc.mu.RLock()
+	geoHashMap := gc.hashMap
+	gc.mu.RUnlock()
+
+	for geoHash, pointsList := range geoHashMap {
+		wg.Add(1)
+		go func(){
+			defer wg.Done()
+			geoPoint := geoHashDecode(geoHash)
+		}()
+	}
+
+	wg.Wait()
+	// можно итерироаться по хэшам и проверять каждый отдельный хэш в горутине, и затем итерироватьс 
+	// по точкам, если они подходят - складываем в результирующую мапу 
+	return result, nil
 }
 
 func (gc *GeoCacheEx) Cleanup(now time.Time) int {
