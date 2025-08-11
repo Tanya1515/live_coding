@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -12,7 +13,7 @@ import (
 
 1) Ограничением 100 запросов/минута (распределение равномерное)
 
-2) Приоритетом для urgent-запросов - каналы + очередь с приоритетом 
+2) Приоритетом для urgent-запросов - каналы + очередь с приоритетом
 
 3) Автоматическим retry для 429/5xx ошибок
 
@@ -51,10 +52,21 @@ type Request struct {
 	Urgent   bool
 }
 
+type ClientRequest struct {
+	req        Request
+	resultChan chan Result
+	context    context.Context
+}
+
 type Response struct {
 	StatusCode int
 	Body       []byte
 	Headers    map[string]string
+}
+
+type Result struct {
+	err      error
+	response *Response
 }
 
 type APIClient interface {
@@ -63,15 +75,19 @@ type APIClient interface {
 }
 
 type APIClientEx struct {
-	controloChan chan struct{}
-	stopChan     chan struct{}
-	config       APIClientConfig
-	mu           *sync.RWMutex
-	wg           *sync.WaitGroup
+	controlChan chan struct{}
+	stopChan    chan struct{}
+	urgentChan  chan ClientRequest
+	generalChan chan ClientRequest
+	config      APIClientConfig
+	mu          *sync.RWMutex
+	wg          *sync.WaitGroup
 }
 
 func NewApiClient(config APIClientConfig) *APIClientEx {
 	controlChan := make(chan struct{}, config.RateLimit)
+	urgentChan := make(chan ClientRequest, config.RateLimit)
+	generalChan := make(chan ClientRequest, config.RateLimit)
 	stopChan := make(chan struct{})
 
 	wg := &sync.WaitGroup{}
@@ -98,32 +114,57 @@ func NewApiClient(config APIClientConfig) *APIClientEx {
 	}()
 
 	return &APIClientEx{
-		mu:           &sync.RWMutex{},
-		controloChan: controlChan,
-		config:       config,
-		stopChan:     stopChan,
-		wg:           wg,
+		mu:          &sync.RWMutex{},
+		controlChan: controlChan,
+		generalChan: generalChan,
+		urgentChan:  urgentChan,
+		config:      config,
+		stopChan:    stopChan,
+		wg:          wg,
 	}
 }
 
 func (api *APIClientEx) Do(ctx context.Context, req Request) (*Response, error) {
-	// разделение на параметры request-а - 
-	// а дальше отправка в соответсвующий канал 
-	// для отправки запроса на сервер
 
-	// два канала
+	clientRequest := ClientRequest{req: req, context: ctx}
+	clientRequest.resultChan = make(chan Result, 1)
 
-	// process request
-	return nil, nil
+	api.wg.Add(1)
+	defer api.wg.Done()
+
+	select {
+	case <-api.stopChan:
+		return nil, errors.New("API Client has been stopped")
+	default:
+		if req.Urgent {
+			api.urgentChan <- clientRequest
+		} else {
+			api.generalChan <- clientRequest
+		}
+	}
+
+	api.wg.Add(1)
+
+	go api.doReq()
+
+	for {
+		select {
+		case <-api.stopChan:
+			return nil, errors.New("API Client has been stopped")
+		case result := <-clientRequest.resultChan:
+			return result.response, result.err
+		}
+	}
 }
 
-func (api *APIClientEx) DoReq(ctx context.Context, req Request) (*Response, error) {
-	api.wg.Add(1)
+func (api *APIClientEx) doReq() {
 
 	defer api.wg.Done()
 
-	resp := &Response{}
+	var req ClientRequest
 	var err error
+	var resp *Response
+
 	api.mu.RLock()
 	timeout := api.config.DefaultTimeout
 	amountOfReauests := api.config.MaxRetries
@@ -133,15 +174,24 @@ func (api *APIClientEx) DoReq(ctx context.Context, req Request) (*Response, erro
 	defer ticker.Stop()
 
 	select {
-	case api.controloChan <- struct{}{}:
-		resp, err = api.Do(ctx, req)
+	case req = <-api.urgentChan:
+	default:
+		req = <-api.generalChan
+	}
+	defer close(req.resultChan)
+
+	select {
+	case api.controlChan <- struct{}{}:
+		resp, err = api.processRequestOnServer(req.req)
 		if err == nil {
-			return resp, err
+			req.resultChan <- Result{response: resp, err: err}
+			return
 		}
 		if (resp.StatusCode == 429 || resp.StatusCode/100 == 5) && err != nil {
 			amountOfReauests--
 		} else {
-			return resp, err
+			req.resultChan <- Result{response: resp, err: err}
+			return
 		}
 	default:
 	}
@@ -149,36 +199,47 @@ func (api *APIClientEx) DoReq(ctx context.Context, req Request) (*Response, erro
 	for {
 		select {
 		case <-api.stopChan:
-			return resp, err
-		case <-ctx.Done():
-			return resp, err
+			req.resultChan <- Result{response: resp, err: err}
+			return
+		case <-req.context.Done():
+			req.resultChan <- Result{response: resp, err: err}
+			return
 		case <-ticker.C:
 			select {
-			case api.controloChan <- struct{}{}:
-				resp, err = api.Do(ctx, req)
+			case api.controlChan <- struct{}{}:
+				resp, err = api.processRequestOnServer(req.req)
 				if amountOfReauests == 0 {
-					return resp, err
+					req.resultChan <- Result{response: resp, err: err}
+					return
 				}
 				if err == nil {
-					return resp, err
+					req.resultChan <- Result{response: resp, err: err}
+					return
 				}
 				if (resp.StatusCode == 429 || resp.StatusCode/100 == 5) && err != nil {
 					timeout *= 2
 					ticker.Reset(timeout)
 					amountOfReauests--
 				} else {
-					return resp, err
+					req.resultChan <- Result{response: resp, err: err}
+					return
 				}
 			default:
 			}
-
 		}
 	}
+}
+
+func (api *APIClientEx) processRequestOnServer(req Request) (*Response, error) {
+	// process request
+	return &Response{}, nil
 }
 
 func (api *APIClientEx) Close() error {
 	close(api.stopChan)
 	api.wg.Wait()
-	close(api.controloChan)
+	close(api.controlChan)
+	close(api.urgentChan)
+	close(api.generalChan)
 	return nil
 }
