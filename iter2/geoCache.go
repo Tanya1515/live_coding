@@ -1,9 +1,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,8 +25,7 @@ import (
 
 2) Потокобезопасный доступ к разным партициям
 
-3) Оптимальный поиск по радиусу (не перебирать все точки) - разделить на квадраты + посмотреть на
-сторону  квадрату < радиуса и посмотреть на точки, которые попадают
+3) Оптимальный поиск по радиусу (не перебирать все точки)
 
 4) TTL-based инвалидация
 
@@ -36,6 +38,11 @@ import (
  - Распределение по партициям
 
 */
+
+const (
+	base32      = "0123456789bcdefghjkmnpqrstuvwxyz"
+	earthRadius = 6371000.0
+)
 
 var Base32Geohash = map[rune]string{
 	'0': "00000",
@@ -130,10 +137,9 @@ type GeoCache interface {
 }
 
 type GeoCacheEx struct {
-	hashMap  map[string][]GeoPoint
-	geoMap   map[GeoPoint]CacheItem
-	mu       *sync.RWMutex
-	stopChan chan struct{}
+	hashMap map[string][]GeoPoint
+	geoMap  map[GeoPoint]CacheItem
+	mu      *sync.RWMutex
 }
 
 func NewGeoCahche() *GeoCacheEx {
@@ -168,7 +174,7 @@ func geoHashDecode(geoHash string) GeoPoint {
 	longtitudeLowerBounder = -180
 
 	for _, let := range geoHash {
-		bitLet, _ := Base32Geohash[let]
+		bitLet := Base32Geohash[let]
 		for _, bit := range bitLet {
 			geoHashBit = append(geoHashBit, bit)
 		}
@@ -292,6 +298,10 @@ func geoHashCode(point GeoPoint) string {
 
 func (gc *GeoCacheEx) Set(point GeoPoint, item CacheItem) error {
 
+	if point.Lat < -90 || point.Lat > 90 || point.Lng < -180 || point.Lng > 180 {
+		return errors.New("invalid coordinates")
+	}
+
 	hashPoint := geoHashCode(point)
 
 	gc.mu.Lock()
@@ -305,6 +315,14 @@ func (gc *GeoCacheEx) Set(point GeoPoint, item CacheItem) error {
 	return nil
 }
 
+func checkIfPointInRadius(point, center GeoPoint, radius float64) bool {
+	d := math.Sqrt((point.Lat-center.Lat)*(point.Lat-center.Lat) + (point.Lng-center.Lng)*(point.Lng-center.Lng))
+	if d <= radius {
+		return true
+	}
+	return false
+}
+
 // Алгоритм следующий:
 
 // 1. Вычисляем bounding box - прямоугольник, который охватывает все точки, которые входят в окружность
@@ -312,56 +330,197 @@ func (gc *GeoCacheEx) Set(point GeoPoint, item CacheItem) error {
 // 3. Проходимся по конкретным точкам geohash из GeoCache и проверяем, принадлежат они окружности или нет.
 
 func (gc *GeoCacheEx) GetInRadius(center GeoPoint, radius float64) (map[GeoPoint]CacheItem, error) {
-	// var wg sync.WaitGroup
-	// var mu sync.Mutex
-	// result := make(map[GeoPoint]CacheItem, 10)
+	var wg sync.WaitGroup
+	result := make(map[GeoPoint]CacheItem, 20)
+	if center.Lat < -90 || center.Lat > 90 || center.Lng < -180 || center.Lng > 180 {
+		return nil, errors.New("invalid center coordinates")
+	}
+	if radius < 0 {
+		return nil, errors.New("radius must be non-negative")
+	}
+	var mu sync.Mutex
+	minLat, maxLat, minLon, maxLon := boundingBox(center.Lat, center.Lng, radius)
 
-	// gc.mu.RLock()
-	// geoHashMap := gc.hashMap
-	// gc.mu.RUnlock()
+	geohashes := coveringGeohashes(minLat, maxLat, minLon, maxLon, 6)
 
-	// for geoHash, pointsList := range geoHashMap {
-	// 	wg.Add(1)
-	// 	go func(){
-	// 		defer wg.Done()
-	// 		geoPoint := geoHashDecode(geoHash)
-	// 	}()
-	// }
+	now := time.Now()
+	for _, hash := range geohashes {
+		wg.Add(1)
+		go func() {
+			localResult := make(map[GeoPoint]CacheItem, 20)
+			defer wg.Done()
+			gc.mu.RLock()
+			geoPointArr, exists := gc.hashMap[hash]
+			gc.mu.RUnlock()
+			if exists {
+				for _, geoPoint := range geoPointArr {
+					if checkIfPointInRadius(geoPoint, center, radius) {
+						gc.mu.RLock()
+						cacheItem, exists := gc.geoMap[geoPoint]
+						gc.mu.RUnlock()
 
-	// wg.Wait()
+						if exists && now.Before(cacheItem.Expires) && checkIfPointInRadius(geoPoint, center, radius) {
+							localResult[geoPoint] = cacheItem
+						}
+					}
+				}
+			}
+			for geoPoint, cacheItem := range localResult {
+				if now.Before(cacheItem.Expires) {
+					mu.Lock()
+					result[geoPoint] = cacheItem
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	wg.Wait()
 
-	return nil, nil
+	return result, nil
+}
+
+func commonGeohashPrefix(geohashes []string) string {
+	if len(geohashes) == 0 {
+		return ""
+	}
+	prefix := geohashes[0]
+	for _, h := range geohashes[1:] {
+		i := 0
+		for ; i < len(prefix) && i < len(h) && prefix[i] == h[i]; i++ {
+		}
+		prefix = prefix[:i]
+		if i == 0 {
+			return ""
+		}
+	}
+	return prefix
+}
+
+func generateSubGeohashes(prefix string, depth int) []string {
+	if depth == 0 {
+		return []string{prefix}
+	}
+	var results []string
+	for _, ch := range base32 {
+		sub := prefix + string(ch)
+		results = append(results, generateSubGeohashes(sub, depth-1)...)
+	}
+	return results
+}
+
+func pointInBoundingBox(minLat, maxLat, minLon, maxLon float64, geoPoint GeoPoint) bool {
+	return geoPoint.Lat >= minLat && geoPoint.Lat <= maxLat && geoPoint.Lng >= minLon && geoPoint.Lng <= maxLon
+}
+
+func coveringGeohashes(minLat, maxLat, minLon, maxLon float64, precision int) []string {
+	corners := []struct{ lat, lon float64 }{
+		{maxLat, minLon}, {maxLat, maxLon}, {minLat, minLon}, {minLat, maxLon},
+	}
+	geohashes := make([]string, len(corners))
+	for i, c := range corners {
+		geohashes[i] = geoHashCode(GeoPoint{Lat: c.lat, Lng: c.lon})
+	}
+	commonPrefix := commonGeohashPrefix(geohashes)
+	candidates := generateSubGeohashes(commonPrefix, precision-len(commonPrefix))
+	var results []string
+	for _, gh := range candidates {
+		ghPoint := geoHashDecode(string(gh))
+		if pointInBoundingBox(minLat, maxLat, minLon, maxLon, ghPoint) {
+			results = append(results, gh)
+		}
+	}
+	return results
 }
 
 func (gc *GeoCacheEx) Cleanup(now time.Time) int {
 	var wg sync.WaitGroup
 
-	removedElements := 0
+	removedElements := int32(0)
 
 	gc.mu.RLock()
 	geoCache := gc.hashMap
 	gc.mu.RUnlock()
 
-	for _, geoArray := range geoCache {
+	for geoHash := range geoCache {
 		wg.Add(1)
 		go func() {
+			now := time.Now()
 			defer wg.Done()
-			for _, geo := range geoArray {
-				gc.mu.Lock()
-				if cacheIt, exists := gc.geoMap[geo]; exists {
-					if !now.After(cacheIt.Expires) {
-						delete(gc.geoMap, geo)
-						removedElements++
-					}
+			gc.mu.RLock()
+			points, exists := gc.hashMap[geoHash]
+			gc.mu.RUnlock()
+			if !exists {
+				return
+			}
+			newPoints := make([]GeoPoint, 0, len(points))
+			for _, geoPoint := range points {
+				gc.mu.RLock()
+				cacheItem, exists := gc.geoMap[geoPoint]
+				gc.mu.RUnlock()
+
+				if exists && now.Before(cacheItem.Expires) {
+					newPoints = append(newPoints, geoPoint)
+				} else {
+					gc.mu.Lock()
+					delete(gc.geoMap, geoPoint)
+					gc.mu.Unlock()
+					atomic.AddInt32(&removedElements, 1)
 				}
+			}
+			if len(newPoints) > 0 {
+				gc.mu.Lock()
+				gc.hashMap[geoHash] = newPoints
+				gc.mu.Unlock()
+			} else {
+				gc.mu.Lock()
+				delete(gc.hashMap, geoHash)
 				gc.mu.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
 
-	return removedElements
+	return int(removedElements)
 
+}
+
+// boundingBox - функция, которая вычисляет ограничивающие координаты для прямоугольника,
+// который включает в себя окружность заданного радиуса.
+
+// Возвращаемые значения:
+
+// minLat, maxLat - минимальная и максимальная широта ограничивающего прямоугольника;
+// minLon, maxLon - минимальная и максимальная долгота ограничивающего прямоугольника
+
+// Радиан - это мера угла. Здесь 1 радиан - это угол, при котором радиус окружности равен длине дуги.
+// Соответсвтенно, 2 радиана - угол, при котором длина дуги в 2 раза больше радиуса.
+
+func boundingBox(lat float64, long float64, radius float64) (minLat, maxLat, minLon, maxLon float64) {
+	// вычисляем угловое расстояние в радианах, соответсвующее дуге длины redius на поверхности Земли
+	// вычисленное radDist - насколько углово можно отойти от центральной широты/долготы
+	radDist := radius / earthRadius
+
+	// переводим центральную широту в градусах в радианы для тригонометрических вычислений
+	radLat := lat * math.Pi / 180
+
+	// вычисляем минимальную и максимальную широты, при этом просто добавляем
+	// и вычитаем угловое расстояние от центральной широты в радианах.
+	minLat = radLat - radDist
+	maxLat = radLat + radDist
+
+	// здесь вычисляем, насколько максимально можно сместиться по долготе.
+	deltaLon := math.Asin(math.Sin(radDist) / math.Cos(radLat))
+
+	// вычисляем минимальную и максимальную долготу
+	minLon = (long * math.Pi / 180) - deltaLon
+	maxLon = (long * math.Pi / 180) + deltaLon
+
+	// преобразуем широту и долготу в градусы.
+	minLat = minLat * 180 / math.Pi
+	maxLat = maxLat * 180 / math.Pi
+	minLon = minLon * 180 / math.Pi
+	maxLon = maxLon * 180 / math.Pi
+	return
 }
 
 // func main() {
