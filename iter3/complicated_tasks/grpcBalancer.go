@@ -1,6 +1,13 @@
 package main
 
-import "time"
+import (
+	"context"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer"
+)
 
 /*
 
@@ -28,22 +35,37 @@ type BalancerConfig struct {
 	MaxFails            int
 }
 
+type Node struct {
+	state          bool
+	amountOfErrors int
+}
+
 type customBalancer struct {
-	// реализация grpc.Balancer
+	cfg   BalancerConfig
+	nodes []string
+	next  int
+	mu    *sync.Mutex
+	wg    *sync.WaitGroup
 }
 
-func NewBuilder(cfg BalancerConfig) grpc.Builder {
-	// ...
+func (b *customBalancer) checkNodeStatus() {
 
 }
 
-// HealthChecker должен проверять доступность эндпоинта
+func NewBuilder(cfg BalancerConfig) balancer.Builder {
+	return balancer.Builder.Build()
+}
 
-type HealthChecker interface {
-	Check(addr string) (bool, error)
+type HealthCheckerEx struct {
+}
+
+func (hc *HealthCheckerEx) Check(addr string) (bool, error) {
+	return true, nil
 }
 
 /*
+
+ grpc.Builder - интерфейс, который используется для создания кастомных баласировщиков.
 
 Circuit breaker - специальный паттерн, который регулирует отправку запросов.
 
@@ -82,7 +104,6 @@ Circuit breaker активируется, когда процент ошибок
 Причем считается среднее время отклика сервиса за указанный промежуток.
 
 4) Можно использовать гибридный метод: отслеживание времени отклика запроса и количество неудачно завершившихся запросов.
-
 
 ResolveNow в балансировщике gRPC — это механизм для принудительного обновления списка серверов,
 позволяющий быстрее реагировать на изменения в инфраструктуре и улучшающий отказоустойчивость.
