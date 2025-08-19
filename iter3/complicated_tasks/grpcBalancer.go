@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/resolver"
 )
 
 /*
@@ -57,8 +59,10 @@ type customBalancer struct {
 	nodes    []Node
 	next     int
 	stopChan chan struct{}
+	subConns map[string]balancer.SubConn
 	mu       *sync.RWMutex
 	wg       *sync.WaitGroup
+	cc       balancer.ClientConn
 }
 
 func NewBuilder(cfg BalancerConfig) balancer.Builder {
@@ -74,6 +78,7 @@ func (b customBalancer) Build(cc balancer.ClientConn, opts balancer.BuildOptions
 	var wg sync.WaitGroup
 	var mu sync.RWMutex
 	nodes := make([]Node, 0)
+	subConns := make(map[string]balancer.SubConn, 100)
 
 	wg.Add(1)
 	go func() {
@@ -103,7 +108,6 @@ func (b customBalancer) Build(cc balancer.ClientConn, opts balancer.BuildOptions
 							wg.Add(1)
 							go func() {
 								defer wg.Done()
-								retries := 0
 								hc := HealthCheckerEx{timeout: hcTime}
 								timerInt := time.NewTicker(hcInt)
 								defer timerInt.Stop()
@@ -118,6 +122,15 @@ func (b customBalancer) Build(cc balancer.ClientConn, opts balancer.BuildOptions
 										state, err := hc.Check(nodeAddress)
 										if err == nil {
 											mu.Lock()
+											defer mu.Unlock()
+											address := resolver.Address{Addr: nodes[key].address}
+											subConn, err := cc.NewSubConn([]resolver.Address{address}, balancer.NewSubConnOptions{})
+											if err != nil {
+												nodes[key].state = Open
+												nodes[key].timer.Reset(10 * time.Second)
+												return
+											}
+											subConns[nodes[key].address] = subConn
 											if nodes[key].rate/2 > nodes[key].amountOfErrors {
 												nodes[key].state = HalfOpen
 												nodes[key].maxRates = 20
@@ -126,24 +139,24 @@ func (b customBalancer) Build(cc balancer.ClientConn, opts balancer.BuildOptions
 												nodes[key].maxRates = -1
 											}
 											nodes[key].timer.Stop()
-											mu.Unlock()
 											return
 										}
 										if err != nil || !state {
-											retries++
+											maxFails--
 											b.mu.Lock()
 											nodes[key].amountOfErrors++
 											nodes[key].rate++
 											b.mu.Unlock()
-											if maxFails == retries {
+											if maxFails == 0 {
 												b.mu.Lock()
 												nodes[key].state = Open
 												nodes[key].timer.Reset(10 * time.Second)
+												delete(subConns, nodes[key].address)
 												b.mu.Unlock()
 												return
 											}
 										}
-										hcInt += 1
+										hcInt *= 2
 										timerInt.Reset(hcInt)
 									}
 								}
@@ -164,6 +177,38 @@ func (b customBalancer) Build(cc balancer.ClientConn, opts balancer.BuildOptions
 		mu:       &mu,
 		stopChan: stopChan,
 		next:     0,
+		cc:       cc,
+		subConns: subConns,
+	}
+}
+
+func (b customBalancer) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+
+	var backend Node
+
+	b.mu.RLock()
+	backends := make([]Node, 0, len(b.nodes))
+	for _, back := range b.nodes {
+		backends = append(backends, back)
+	}
+	nextNode := b.next
+	b.mu.RUnlock()
+
+	finalNode := nextNode
+	for {
+		backend = backends[nextNode%len(backends)]
+		if backend.state == Closed || (backend.state == HalfOpen && backend.maxRates > backend.rate) {
+			b.mu.Lock()
+			b.next = nextNode + 1
+			subconn := b.subConns[backend.address]
+			b.nodes[nextNode%len(backends)].rate++
+			b.mu.Unlock()
+			return balancer.PickResult{SubConn: subconn}, nil
+		}
+		if nextNode == finalNode {
+			return balancer.PickResult{}, errors.New("No backends are available")
+		}
+		nextNode++
 	}
 }
 
@@ -191,7 +236,6 @@ func (b customBalancer) ResolverError(err error) {
 			b.wg.Add(1)
 			go func() {
 				defer b.wg.Done()
-				retries := 0
 
 				b.mu.RLock()
 				hcInt := b.cfg.HealthCheckInterval
@@ -210,6 +254,8 @@ func (b customBalancer) ResolverError(err error) {
 						state, err := hc.Check(nodeAddress)
 						if err == nil {
 							b.mu.Lock()
+							b.nodes[key].rate++
+							defer b.mu.Unlock()
 							if b.nodes[key].rate/2 > b.nodes[key].amountOfErrors {
 								b.nodes[key].state = HalfOpen
 								b.nodes[key].maxRates = 20
@@ -217,29 +263,38 @@ func (b customBalancer) ResolverError(err error) {
 								b.nodes[key].state = Closed
 								b.nodes[key].maxRates = -1
 							}
+							address := resolver.Address{Addr: b.nodes[key].address}
+							subConn, err := b.cc.NewSubConn([]resolver.Address{address}, balancer.NewSubConnOptions{})
+							if err != nil {
+								b.nodes[key].state = Open
+								b.nodes[key].timer = *time.NewTicker(10 * time.Second)
+								return
+							} else {
+								b.subConns[b.nodes[key].address] = subConn
+							}
 							b.nodes[key].rate = 0
 							b.nodes[key].amountOfErrors = 0
 							b.nodes[key].timer.Stop()
-							b.mu.Unlock()
 							return
 						}
 						if err != nil || !state {
-							retries++
+							maxRetries--
 							b.mu.Lock()
 							b.nodes[key].amountOfErrors++
 							b.nodes[key].rate++
 							b.mu.Unlock()
-							if maxRetries == retries {
+							if maxRetries == 0 {
 								b.mu.Lock()
 								b.nodes[key].rate = 0
 								b.nodes[key].amountOfErrors = 0
 								b.nodes[key].state = Open
 								b.nodes[key].timer = *time.NewTicker(10 * time.Second)
+								delete(b.subConns, b.nodes[key].address)
 								b.mu.Unlock()
 								return
 							}
 						}
-						hcInt += 1
+						hcInt *= 2
 						timerInt.Reset(hcInt)
 					case <-b.stopChan:
 						return
@@ -253,13 +308,14 @@ func (b customBalancer) ResolverError(err error) {
 
 // Вызывается gRPC при изменении состояния ClientConn, например,
 // когда resolver предоставляет новые адреса бэкендов или обновляется конфигурация балансировки.
-func (b customBalancer) UpdateClientConnState(resolver balancer.ClientConnState) error {
+// Для текущей задачи - это ResolveNow
+func (b customBalancer) UpdateClientConnState(resolverBal balancer.ClientConnState) error {
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
 	nodes := make([]Node, 0)
-	for _, node := range resolver.ResolverState.Addresses {
+	for _, node := range resolverBal.ResolverState.Addresses {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -278,6 +334,18 @@ func (b customBalancer) UpdateClientConnState(resolver balancer.ClientConnState)
 				if !state || err != nil {
 					nodeInfo.state = Open
 					nodeInfo.timer = *time.NewTicker(10 * time.Second)
+				} else {
+					nodeInfo.rate++
+					address := resolver.Address{Addr: node.Addr}
+					subConn, err := b.cc.NewSubConn([]resolver.Address{address}, balancer.NewSubConnOptions{})
+					if err != nil {
+						nodeInfo.state = Open
+						nodeInfo.timer = *time.NewTicker(10 * time.Second)
+					} else {
+						mu.Lock()
+						b.subConns[node.Addr] = subConn
+						mu.Unlock()
+					}
 				}
 				mu.Lock()
 				nodes = append(nodes, nodeInfo)
@@ -368,6 +436,11 @@ type PickResult struct {
     SubConn SubConn
     Done    func(DoneInfo)
 }
+
+Метод Pick(info PickInfo) вызывается gRPC runtime (внутренней частью gRPC-клиента) каждый раз,
+когда клиент отправляет новый RPC-запрос (например, унарный вызов или потоковый запрос).
+Pick — это часть интерфейса balancer.Picker, который предоставляется вашим кастомным балансировщиком через метод buildPicker.
+gRPC использует Picker, чтобы определить, на какой SubConn (соединение с бэкендом) отправить конкретный запрос.
 
 ----------------------------------------------------------------------------------------------------------------------------------------------------------
 
