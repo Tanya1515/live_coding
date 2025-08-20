@@ -9,6 +9,7 @@ type Base struct {
 	Type string
 }
 
+// встраивание
 type Derived struct {
 	Base
 	Value int
@@ -23,7 +24,7 @@ func main() {
 
 	var base Base
 
-	json.Unmarshal(b, &base)
+	json.Unmarshal(b, &base) // мое предположение: будет ошибка (неверное)
 
 	fmt.Printf("%+v\n", base)
 }

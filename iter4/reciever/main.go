@@ -15,9 +15,9 @@ func (i *MyInt) Inc() {
 func main() {
 	var x MyInt = 10
 
-	fmt.Println(x.Val())
+	fmt.Println(x.Val()) // 10
 
-	x.Inc()
+	x.Inc() // 11
 
-	fmt.Println(x.Val())
+	fmt.Println(x.Val()) // 11
 }
