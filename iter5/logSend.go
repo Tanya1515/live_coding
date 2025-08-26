@@ -53,29 +53,25 @@ func sendLogs(ctx context.Context, from LogSystem, to LogSystem, date time.Time)
 	if err != nil {
 		return fmt.Errorf("error while list files from log sys: %s", err)
 	}
+	chunkLog := make([]LogChunk, 0, amountOfChunks)
 	for _, file := range files {
-		chunkLog := make([]LogChunk, 0, 10)
 		chunk, err := from.ReadFile(ctx, date, file)
 		if err != nil {
 			return fmt.Errorf("error while reading file %s from log sys: %s", file, err)
 		}
 		if len(chunk) <= chunkSize {
 			chunkLog = append(chunkLog, chunk)
-			continue
-		}
-		fileSize := len(chunk) / chunkSize
-		for i := 0; i < fileSize; i++ {
-			chunkToSave := chunk[:1024]
-			chunkLog = append(chunkLog, chunkToSave)
-			chunk = chunk[1024:]
-		}
-		chunkLog = append(chunkLog, chunk)
-
-		if len(chunkLog) <= amountOfChunks {
-			err = to.WriteLogs(ctx, date, chunkLog)
-			if err != nil {
-				return fmt.Errorf("error while sendibng file %s to target log sys: %s", file, err)
+		} else {
+			fileSize := len(chunk) / chunkSize
+			for i := 0; i < fileSize; i++ {
+				chunkToSave := chunk[:1024]
+				chunkLog = append(chunkLog, chunkToSave)
+				chunk = chunk[1024:]
 			}
+			chunkLog = append(chunkLog, chunk)
+		}
+
+		if len(chunkLog) < amountOfChunks {
 			continue
 		}
 		chunkSendSize := len(chunkLog) / amountOfChunks
@@ -91,6 +87,7 @@ func sendLogs(ctx context.Context, from LogSystem, to LogSystem, date time.Time)
 		if err != nil {
 			return fmt.Errorf("error while sendibng file %s to target log sys: %s", file, err)
 		}
+		chunkLog = chunkLog[:0]
 	}
 	return nil
 }
