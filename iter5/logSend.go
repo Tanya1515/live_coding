@@ -51,22 +51,22 @@ func Connect(ctx context.Context, systemType string) (LogSystem, error)
 func sendLogs(ctx context.Context, from LogSystem, to LogSystem, date time.Time) error {
 	files, err := from.ListFiles(ctx, date)
 	if err != nil {
-		return fmt.Errorf("error while list files from log sys: %s", err)
+		return fmt.Errorf("error %v: error while list files from log sys: %s", time.Now(), err)
 	}
 	chunkLog := make([]LogChunk, 0, amountOfChunks)
 	for _, file := range files {
 		chunk, err := from.ReadFile(ctx, date, file)
 		if err != nil {
-			return fmt.Errorf("error while reading file %s from log sys: %s", file, err)
+			return fmt.Errorf("error %v: error while reading file %s from log sys: %s", time.Now(), file, err)
 		}
 		if len(chunk) <= chunkSize {
 			chunkLog = append(chunkLog, chunk)
 		} else {
 			fileSize := len(chunk) / chunkSize
 			for i := 0; i < fileSize; i++ {
-				chunkToSave := chunk[:1024]
+				chunkToSave := chunk[:chunkSize]
 				chunkLog = append(chunkLog, chunkToSave)
-				chunk = chunk[1024:]
+				chunk = chunk[chunkSize:]
 			}
 			chunkLog = append(chunkLog, chunk)
 		}
@@ -79,13 +79,13 @@ func sendLogs(ctx context.Context, from LogSystem, to LogSystem, date time.Time)
 			chunkToSend := chunkLog[:amountOfChunks]
 			err = to.WriteLogs(ctx, date, chunkToSend)
 			if err != nil {
-				return fmt.Errorf("error while sendibng file %s to target log sys: %s", file, err)
+				return fmt.Errorf("error %v: error while sendibng file %s to target log sys: %s", time.Now(), file, err)
 			}
 			chunkLog = chunkLog[amountOfChunks:]
 		}
 		err = to.WriteLogs(ctx, date, chunkLog)
 		if err != nil {
-			return fmt.Errorf("error while sendibng file %s to target log sys: %s", file, err)
+			return fmt.Errorf("error %v: error while sendibng file %s to target log sys: %s", time.Now(), file, err)
 		}
 		chunkLog = chunkLog[:0]
 	}
@@ -97,55 +97,38 @@ func sendLogs(ctx context.Context, from LogSystem, to LogSystem, date time.Time)
 func Send(from string, to string, full bool) error {
 	ctx := context.Background()
 
-	g := new(errgroup.Group)
-
 	fromLog, err := Connect(ctx, from)
 	if err != nil {
-		return fmt.Errorf("error while connecting to log system: %s", err)
+		return fmt.Errorf("error %v: error while connecting to log system: %s", time.Now(), err)
 	}
 	defer fromLog.Close()
 
 	toLog, err := Connect(ctx, to)
 	if err != nil {
-		return fmt.Errorf("error while connecting to log system: %s", err)
+		return fmt.Errorf("error %v: error while connecting to log system: %s", time.Now(), err)
 	}
 	defer toLog.Close()
 
 	datesFrom, err := fromLog.ListDates(ctx)
 	if err != nil {
-		return fmt.Errorf("error while getting dates from log sys: %s", err)
+		return fmt.Errorf("error %v: error while getting dates from log sys: %s", time.Now(), err)
 	}
 
-	semaphore := make(chan struct{}, workerAmount)
-	defer close(semaphore)
-
-	if full {
-		for _, date := range datesFrom {
-			g.Go(func() error {
-				semaphore <- struct{}{}
-				err := sendLogs(ctx, fromLog, toLog, date)
-				<-semaphore
-				return err
-			})
+	if !full {
+		datesTo, err := toLog.ListDates(ctx)
+		if err != nil {
+			return fmt.Errorf("error %v: error while getting dates from log sys: %s", time.Now(), err)
 		}
-		if err := g.Wait(); err != nil {
-			return err
+		if len(datesTo) != 0 {
+			datesFrom = datesFrom[len(datesTo)-1:]
 		}
-		return nil
 	}
 
-	datesTo, err := toLog.ListDates(ctx)
-	if err != nil {
-		return fmt.Errorf("error while getting dates from log sys: %s", err)
-	}
-
-	datesToSend := datesFrom[len(datesTo)-1:]
-
-	for _, date := range datesToSend {
+	g := new(errgroup.Group)
+	g.SetLimit(workerAmount)
+	for _, date := range datesFrom {
 		g.Go(func() error {
-			semaphore <- struct{}{}
 			err := sendLogs(ctx, fromLog, toLog, date)
-			<-semaphore
 			return err
 		})
 	}
