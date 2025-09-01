@@ -55,39 +55,44 @@ func sendLogs(ctx context.Context, from LogSystem, to LogSystem, date time.Time)
 	}
 	chunkLog := make([]LogChunk, 0, amountOfChunks)
 	for _, file := range files {
-		chunk, err := from.ReadFile(ctx, date, file)
-		if err != nil {
-			return fmt.Errorf("error %v: error while reading file %s from log sys: %s", time.Now(), file, err)
-		}
-		if len(chunk) <= chunkSize {
-			chunkLog = append(chunkLog, chunk)
-		} else {
-			fileSize := len(chunk) / chunkSize
-			for i := 0; i < fileSize; i++ {
-				chunkToSave := chunk[:chunkSize]
-				chunkLog = append(chunkLog, chunkToSave)
-				chunk = chunk[chunkSize:]
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			chunk, err := from.ReadFile(ctx, date, file)
+			if err != nil {
+				return fmt.Errorf("error %v: error while reading file %s from log sys: %s", time.Now(), file, err)
 			}
-			chunkLog = append(chunkLog, chunk)
-		}
+			if len(chunk) <= chunkSize {
+				chunkLog = append(chunkLog, chunk)
+			} else {
+				fileSize := len(chunk) / chunkSize
+				for i := 0; i < fileSize; i++ {
+					chunkToSave := chunk[:chunkSize]
+					chunkLog = append(chunkLog, chunkToSave)
+					chunk = chunk[chunkSize:]
+				}
+				chunkLog = append(chunkLog, chunk)
+			}
 
-		if len(chunkLog) < amountOfChunks {
-			continue
-		}
-		chunkSendSize := len(chunkLog) / amountOfChunks
-		for i := 0; i < chunkSendSize; i++ {
-			chunkToSend := chunkLog[:amountOfChunks]
-			err = to.WriteLogs(ctx, date, chunkToSend)
+			if len(chunkLog) < amountOfChunks {
+				continue
+			}
+			chunkSendSize := len(chunkLog) / amountOfChunks
+			for i := 0; i < chunkSendSize; i++ {
+				chunkToSend := chunkLog[:amountOfChunks]
+				err = to.WriteLogs(ctx, date, chunkToSend)
+				if err != nil {
+					return fmt.Errorf("error %v: error while sendibng file %s to target log sys: %s", time.Now(), file, err)
+				}
+				chunkLog = chunkLog[amountOfChunks:]
+			}
+			err = to.WriteLogs(ctx, date, chunkLog)
 			if err != nil {
 				return fmt.Errorf("error %v: error while sendibng file %s to target log sys: %s", time.Now(), file, err)
 			}
-			chunkLog = chunkLog[amountOfChunks:]
+			chunkLog = chunkLog[:0]
 		}
-		err = to.WriteLogs(ctx, date, chunkLog)
-		if err != nil {
-			return fmt.Errorf("error %v: error while sendibng file %s to target log sys: %s", time.Now(), file, err)
-		}
-		chunkLog = chunkLog[:0]
 	}
 	return nil
 }
@@ -124,12 +129,11 @@ func Send(from string, to string, full bool) error {
 		}
 	}
 
-	g := new(errgroup.Group)
+	g, groupCTX := errgroup.WithContext(ctx)
 	g.SetLimit(workerAmount)
 	for _, date := range datesFrom {
 		g.Go(func() error {
-			err := sendLogs(ctx, fromLog, toLog, date)
-			return err
+			return sendLogs(groupCTX, fromLog, toLog, date)
 		})
 	}
 	if err := g.Wait(); err != nil {
