@@ -87,6 +87,11 @@ func ProcessEvents(source EventSource, stateStore StateStore, firstRun bool) err
 		for nextExist && event.Timestamp < lastTime {
 			event, nextExist = source.ReadNext()
 		}
+
+		if event.Timestamp > lastTime {
+			lastTime = event.Timestamp
+		}
+
 		if !nextExist {
 			return nil
 		}
