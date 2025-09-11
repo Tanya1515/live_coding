@@ -45,7 +45,8 @@ type CacheItem struct {
 	Value      []byte
 	ExpiresAt  time.Time
 	InProgress bool // Флаг обработки
-	LockToken  UUID // Токен блокировки
+	// разобраться с LockToken
+	LockToken UUID // Токен блокировки
 }
 
 // Конфигурация прокси
@@ -69,6 +70,8 @@ type CacheProxy struct {
 	stopChan chan struct{}
 	mu       *sync.RWMutex
 	semChan  chan struct{}
+	// сделать мапу, в которую бы записывался таймер,
+	// по которому следует завершать ожидание
 	// Далее - поля для реализации
 }
 
@@ -110,6 +113,7 @@ func (cp *CacheProxy) saveCacheItem(id string, result []byte, inProgress bool) {
 			uuid: uuid,
 		}
 		cp.mu.Unlock()
+		return
 	}
 	timeNow := time.Now()
 	timeToExpire := timeNow.Add(cp.config.CacheTTL)
@@ -130,37 +134,38 @@ func (cp *CacheProxy) saveCacheItem(id string, result []byte, inProgress bool) {
 
 // Основной метод получения ресурса
 func (cp *CacheProxy) GetResource(id string) ([]byte, error) {
-	timeNow := time.Now()
 	cp.mu.RLock()
 	item, exists := cp.idToUUID[id]
 
 	if exists {
 		cacheItem := cp.storage.Get(item.uuid)
 		cp.mu.RUnlock()
-		for cacheItem.InProgress {
-			time.Sleep(10 *time.Second)
+		// подумать, а что делать если элемент протух по времени и удалился из кэша
+		for {
+			time.Sleep(10 * time.Second)
+			timeNow := time.Now()
 			cp.mu.RLock()
 			cacheItem = cp.storage.Get(item.uuid)
+			if !cacheItem.InProgress {
+				if timeNow.After(cacheItem.ExpiresAt) && (len(cacheItem.Value) != 0) {
+					cp.mu.RUnlock()
+					return cacheItem.Value, nil
+				}
+				cacheItem.InProgress = true
+				cp.storage.Update(item.uuid, cacheItem)
+				cp.mu.RUnlock()
+				break
+			}
 			cp.mu.RUnlock()
 		}
-		if timeNow.After(cacheItem.ExpiresAt) && (len(cacheItem.Value) != 0) {
-				return cacheItem.Value, nil
-		}
-
-		if len(cacheItem.Value) == 0 {
-			cp.saveCacheItem(id, nil, true)
-		} else {
-			cp.mu.Lock()
-			// оператор для очистка данных из storage ??
-			delete(cp.idToUUID, id)
-			cp.mu.Unlock()
-		}
 	} else {
+		cp.mu.RUnlock()
 		cp.saveCacheItem(id, nil, true)
 	}
 	cp.semChan <- struct{}{}
 	result, err := cp.backend.GetResource(id)
 	<-cp.semChan
+	// изменить: не надо создавать заново элемент
 	cp.saveCacheItem(id, result, false)
 	return result, err
 }
@@ -190,7 +195,6 @@ func (cp *CacheProxy) CleanupExpired() {
 			for id := range copy {
 				cp.mu.Lock()
 				delete(cp.idToUUID, id)
-				// почистить из storage
 				cp.mu.Unlock()
 			}
 
