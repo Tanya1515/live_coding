@@ -7,7 +7,6 @@ package main
 
 import (
 	"sync"
-	_ "sync"
 	"time"
 )
 
@@ -30,45 +29,41 @@ func NewConcurrentTTLCache() *ConcurrentTTLCache {
 	cacheTTL := &ConcurrentTTLCache{
 		cacheMutex: &sync.RWMutex{},
 		cacheMap:   cache,
+		chanStop:   chanStop,
 	}
-	go func(cacheTTL *ConcurrentTTLCache) {
-		ticker := time.NewTicker(2 * time.Second)
-		for {
-			select {
-			case <-ticker.C:
-				ElementsToRemove := make(map[string]struct{}, len(cacheTTL.cacheMap))
-				cacheTTL.cacheMutex.RLock()
-				for key, value := range cacheTTL.cacheMap {
-					if !value.expiry.After(time.Now()) {
-						ElementsToRemove[key] = struct{}{}
-					}
-				}
-				cacheTTL.cacheMutex.RUnlock()
-
-				for key := range ElementsToRemove {
-					cacheTTL.cacheMutex.Lock()
-					value, _ := cacheTTL.cacheMap[key]
-					if !value.expiry.After(time.Now()) {
-						delete(cacheTTL.cacheMap, key)
-					}
-					cacheTTL.cacheMutex.Unlock()
-				}
-
-				for key, value := range cacheTTL.cacheMap {
-					cacheTTL.cacheMutex.Lock()
-					if !value.expiry.After(time.Now()) {
-						delete(cacheTTL.cacheMap, key)
-					}
-					cacheTTL.cacheMutex.Unlock()
-				}
-			case <-chanStop:
-				ticker.Stop()
-				return
-			}
-		}
-	}(cacheTTL)
+	go cacheTTL.clearCache()
 
 	return cacheTTL
+}
+
+func (c *ConcurrentTTLCache) clearCache() {
+	ticker := time.NewTicker(2 * time.Second)
+	for {
+		select {
+		case <-ticker.C:
+			ElementsToRemove := make(map[string]struct{}, len(c.cacheMap))
+			c.cacheMutex.RLock()
+			for key, value := range c.cacheMap {
+				if !value.expiry.After(time.Now()) {
+					ElementsToRemove[key] = struct{}{}
+				}
+			}
+			c.cacheMutex.RUnlock()
+
+			for key := range ElementsToRemove {
+				c.cacheMutex.Lock()
+				value, _ := c.cacheMap[key]
+				if !value.expiry.After(time.Now()) {
+					delete(c.cacheMap, key)
+				}
+				c.cacheMutex.Unlock()
+			}
+
+		case <-c.chanStop:
+			ticker.Stop()
+			return
+		}
+	}
 }
 
 func (c *ConcurrentTTLCache) Set(key string, value interface{}, ttl time.Duration) {
@@ -78,7 +73,6 @@ func (c *ConcurrentTTLCache) Set(key string, value interface{}, ttl time.Duratio
 	defer c.cacheMutex.Unlock()
 
 	c.cacheMap[key] = CacheItem{value: value, expiry: timeToExpire}
-	return
 }
 
 func (c *ConcurrentTTLCache) Get(key string) (interface{}, bool) {
@@ -91,6 +85,9 @@ func (c *ConcurrentTTLCache) Get(key string) (interface{}, bool) {
 	}
 
 	if !value.expiry.After(time.Now()) {
+		c.cacheMutex.Lock()
+		delete(c.cacheMap, key)
+		c.cacheMutex.Unlock()
 		return nil, false
 	}
 
