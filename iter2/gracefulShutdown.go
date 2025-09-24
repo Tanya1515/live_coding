@@ -48,7 +48,7 @@ type HandlerWithContext func(ctx context.Context, w http.ResponseWriter, r *http
 
 type Config struct {
 	Addr         string        `yaml:"addr"`         // адрес, который слушает http-сервер
-	ReadTimeout  time.Duration `yaml:"read_timeout"` // не очень понятно, что за таймауты ?
+	ReadTimeout  time.Duration `yaml:"read_timeout"` 
 	WriteTimeout time.Duration `yaml:"write_timeout"`
 	Workers      int           `yaml:"workers"` // количество worker-ов, которые обрабатывают запросы
 }
@@ -149,6 +149,30 @@ func (s *ServerEx) serverWorker() {
 	}
 }
 
+func (s *ServerEx) processServerSignal(sigChan chan os.Signal) {
+	for {
+		select {
+		case signal := <-sigChan:
+			switch signal {
+			case syscall.SIGINT:
+				go func() {
+					s.Stop(context.Background())
+				}()
+			case syscall.SIGTERM:
+				go func() {
+					s.Stop(context.Background())
+				}()
+			case syscall.SIGHUP:
+				// непонятно, откуда получать конфиг
+				s.ReloadConfig(Config{Addr: "localhost:8080", ReadTimeout: 1 * time.Second, WriteTimeout: 2 * time.Second, Workers: 3})
+			}
+		case <-s.serverContext.Done():
+			return
+		default:
+		}
+	}
+}
+
 func (s *ServerEx) Start() error {
 
 	for i := 0; i < s.cfg.Workers; i++ {
@@ -175,29 +199,7 @@ func (s *ServerEx) Start() error {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGTERM)
 
-	go func() {
-		for {
-			select {
-			case signal := <-sigChan:
-				switch signal {
-				case syscall.SIGINT:
-					go func() {
-						s.Stop(context.Background())
-					}()
-				case syscall.SIGTERM:
-					go func() {
-						s.Stop(context.Background())
-					}()
-				case syscall.SIGHUP:
-					// непонятно, откуда получать конфиг
-					s.ReloadConfig(Config{Addr: "localhost:8080", ReadTimeout: 1 * time.Second, WriteTimeout: 2 * time.Second, Workers: 3})
-				}
-			case <-s.serverContext.Done():
-				return
-			default:
-			}
-		}
-	}()
+	go s.processServerSignal(sigChan)
 
 	return nil
 }
@@ -210,9 +212,11 @@ type Task struct {
 }
 
 func (s *ServerEx) RegisterHandler(path string, handler HandlerWithContext) error {
+	// проверяем, существует ли уже handler
 	s.mu.RLock()
 
 	if _, exists := s.registeredHandlers[path]; exists {
+		// если по конкретному пути существует handler - выкидываем ошибку.
 		s.mu.RUnlock()
 		return errors.New("Error: handler with path " + path + " already exists")
 	}
@@ -221,6 +225,8 @@ func (s *ServerEx) RegisterHandler(path string, handler HandlerWithContext) erro
 	s.mu.Lock()
 	s.registeredHandlers[path] = handler
 
+	// в качестве handler заводим функцию, которая будет записывать задачи в канал 
+	// для горутин или завершаться по контексту. 
 	s.serverHandlers.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 		for {
 			select {
