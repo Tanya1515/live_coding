@@ -137,6 +137,7 @@ func (cp *CacheProxy) GetResource(id string) ([]byte, error) {
 		Value:    id,
 	}
 	sliceOperator = append(sliceOperator, findOperator)
+	// находим cacheItem, если он существует
 	cp.mu.Lock()
 	cacheItems := cp.storage.Find(sliceOperator)
 	if len(cacheItems) == 0 {
@@ -145,20 +146,28 @@ func (cp *CacheProxy) GetResource(id string) ([]byte, error) {
 	} else {
 		cp.mu.Unlock()
 		for {
+			// проверяем, появился ли элемент в cache? 
 			cp.mu.Lock()
-			item := cp.storage.Find(sliceOperator)[0]
-			if !item.InProgress && len(item.Value) != 0 && time.Now().Before(item.ExpiresAt) {
-				cp.mu.Unlock()
-				return item.Value, nil
-			}
-			if !item.InProgress {
-				if _, exists := cp.uuidCache[id]; exists && (item.LockToken == "" || time.Now().After(item.LockExpiresAt)) {
-					cp.saveElem(id, data, true, item.RecordUUID)
+			items := cp.storage.Find(sliceOperator)
+			var item CacheItem 
+			if len(items) != 0 {
+				item = items[0]
+				// если появился - проверяем, что элемент обработан и есть значение, которое актуально
+				if !item.InProgress && len(item.Value) != 0 && time.Now().Before(item.ExpiresAt) {
+					cp.mu.Unlock()
+					return item.Value, nil
+				}
+				// если значения нет или оно неактуально, тогда этот конкретный инстанс будет теперь обслуживать 
+				// этот элемент. 
+				if !item.InProgress {
+					if _, exists := cp.uuidCache[id]; exists && (item.LockToken == "" || time.Now().After(item.LockExpiresAt)) {
+						cp.saveElem(id, data, true, item.RecordUUID)
+					}
+					cp.mu.Unlock()
+					break
 				}
 				cp.mu.Unlock()
-				break
 			}
-			cp.mu.Unlock()
 			time.Sleep(3 * time.Second)
 		}
 	}
@@ -179,20 +188,17 @@ func (cp *CacheProxy) CleanupExpired() {
 			return
 		default:
 			time.Sleep(500 * time.Second)
-			copyCache := make(map[string]Item, len(cp.uuidCache))
+			copyCache := make(map[string]struct{}, len(cp.uuidCache))
 			cp.mu.RLock()
 			for key, value := range cp.uuidCache {
-				copyCache[key] = value
-			}
-			cp.mu.RUnlock()
-			for key, value := range copyCache {
-				if time.Now().After(value.ExpiresAt) {
-					delete(copyCache, key)
+				if !time.Now().After(value.ExpiresAt){
+					copyCache[key] = struct{}{}
 				}
 			}
+			cp.mu.RUnlock()
 			for key := range copyCache {
 				cp.mu.Lock()
-				if time.Now().After(cp.uuidCache[key].ExpiresAt) {
+				if !time.Now().After(cp.uuidCache[key].ExpiresAt) {
 					delete(cp.uuidCache, key)
 				}
 				cp.mu.Unlock()
