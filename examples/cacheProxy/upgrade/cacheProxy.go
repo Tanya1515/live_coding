@@ -123,13 +123,35 @@ func (cp *CacheProxy) saveElem(id string, data []byte, inProgress bool, uuidToke
 	cp.storage.Update(item.uuid, cacheItem)
 	return
 }
-func (cp *CacheProxy) checkElem(item CacheItem) bool {
-	return time.Now().After(item.LockExpiresAt)
+
+func (cp *CacheProxy) processCacheElem(sliceOperator []FindOperator) ([]byte, bool) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	cacheItems := cp.storage.Find(sliceOperator)
+	if len(cacheItems) == 0 { 
+		cp.saveElem(sliceOperator[0].Key, nil, true, "")
+		return nil, true
+	}
+
+	item := cacheItems[0]
+	if !item.InProgress && len(item.Value) != 0 && !time.Now().After(item.ExpiresAt) {
+		return item.Value, true
+	}
+
+	if !item.InProgress {
+		if _, exists := cp.uuidCache[item.Key]; exists && (item.LockToken == "" || time.Now().After(item.LockExpiresAt)) {
+			cp.saveElem(item.Key, nil, true, item.RecordUUID)
+			return nil, true
+		}
+	}
+	
+	return nil, false
 }
 
 // Основной метод получения ресурса
 func (cp *CacheProxy) GetResource(id string) ([]byte, error) {
-	data := make([]byte, 0)
+	var err error
 	sliceOperator := make([]FindOperator, 0)
 	findOperator := FindOperator{
 		Key:      "Key",
@@ -137,50 +159,34 @@ func (cp *CacheProxy) GetResource(id string) ([]byte, error) {
 		Value:    id,
 	}
 	sliceOperator = append(sliceOperator, findOperator)
-	// находим cacheItem, если он существует
-	cp.mu.Lock()
-	cacheItems := cp.storage.Find(sliceOperator)
-	if len(cacheItems) == 0 {
-		cp.saveElem(id, data, true, "")
-		cp.mu.Unlock()
-	} else {
-		cp.mu.Unlock()
-		for {
-			// проверяем, появился ли элемент в cache? 
-			cp.mu.Lock()
-			items := cp.storage.Find(sliceOperator)
-			var item CacheItem 
-			if len(items) != 0 {
-				item = items[0]
-				// если появился - проверяем, что элемент обработан и есть значение, которое актуально
-				if !item.InProgress && len(item.Value) != 0 && time.Now().Before(item.ExpiresAt) {
-					cp.mu.Unlock()
-					return item.Value, nil
-				}
-				// если значения нет или оно неактуально, тогда этот конкретный инстанс будет теперь обслуживать 
-				// этот элемент. 
-				if !item.InProgress {
-					if _, exists := cp.uuidCache[id]; exists && (item.LockToken == "" || time.Now().After(item.LockExpiresAt)) {
-						cp.saveElem(id, data, true, item.RecordUUID)
-					}
-					cp.mu.Unlock()
-					break
-				}
-				cp.mu.Unlock()
-			}
-			time.Sleep(3 * time.Second)
+
+	var data []byte
+	var exists bool
+
+	for {
+		data, exists = cp.processCacheElem(sliceOperator)
+		if exists {
+			break
 		}
+		time.Sleep(3 * time.Second)
 	}
-	cp.sem <- struct{}{}
-	data, err := cp.back.GetResource(id)
-	<-cp.sem
-	cp.mu.Lock()
-	cp.saveElem(id, data, false, "")
-	cp.mu.Unlock()
+
+	if data == nil {
+		cp.sem <- struct{}{}
+		data, err = cp.back.GetResource(id)
+		<-cp.sem
+		cp.mu.Lock()
+		cp.saveElem(id, data, false, "")
+		cp.mu.Unlock()
+	} 
+	
 	return data, err
 }
 
 // Метод для очистки просроченных записей (вызывается периодически)
+// time.Now().After(item.ExpiresAt) возвращает true, когда:
+// Текущее время больше (позже) времени ExpiresAt
+// То есть данные уже протухли (expired)
 func (cp *CacheProxy) CleanupExpired() {
 	for {
 		select {
@@ -191,14 +197,15 @@ func (cp *CacheProxy) CleanupExpired() {
 			copyCache := make(map[string]struct{}, len(cp.uuidCache))
 			cp.mu.RLock()
 			for key, value := range cp.uuidCache {
-				if !time.Now().After(value.ExpiresAt){
+				if time.Now().After(value.ExpiresAt) {
 					copyCache[key] = struct{}{}
 				}
 			}
+
 			cp.mu.RUnlock()
 			for key := range copyCache {
 				cp.mu.Lock()
-				if !time.Now().After(cp.uuidCache[key].ExpiresAt) {
+				if time.Now().After(cp.uuidCache[key].ExpiresAt) {
 					delete(cp.uuidCache, key)
 				}
 				cp.mu.Unlock()
