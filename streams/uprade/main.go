@@ -247,7 +247,7 @@ func (cs *CombinedStream) Seek(offset int64, whence int) (int64, error) {
         return -1, io.EOF
     }
 
-    return offset, nil
+    return cs.currentPointer, nil
 }
 
 func (cs *CombinedStream) Close() error {
