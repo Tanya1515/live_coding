@@ -62,9 +62,8 @@ func NewCombinedStream(streams ...MeasuredStream) *CombinedStream {
 }
 
 func (cs *CombinedStream) Read(p []byte) (n int, err error) {
-	readSize := len(p)
-	if readSize == 0 {
-		return 0, nil
+	if len(p) == 0 {
+		return 0, fmt.Errorf("buffer for reading is Empty")
 	}
 	if cs.TotalSize() == 0 {
 		return 0, io.EOF
@@ -72,16 +71,14 @@ func (cs *CombinedStream) Read(p []byte) (n int, err error) {
 	processedSize := 0
 
 	for i := cs.indexCurrentStream; i < len(cs.streams); i++ {
-		n, err := cs.streams[i].Read(p[processedSize : processedSize+readSize])
-		if err != nil && err != io.EOF {
-			processedSize += n
-			cs.currentPointer += int64(n)
-			return processedSize, fmt.Errorf("error while reading data from stream: %v", err)
-		}
+		n, err := cs.streams[i].Read(p[processedSize : ])
 		processedSize += n
 		cs.currentPointer += int64(n)
-		readSize -= n
-		if readSize == 0 {
+		if err != nil && err != io.EOF {
+			return processedSize, fmt.Errorf("error while reading data from stream: %w", err)
+		}
+		
+		if processedSize == len(p) {
 			return processedSize, nil
 		}
 
@@ -90,68 +87,69 @@ func (cs *CombinedStream) Read(p []byte) (n int, err error) {
 	return processedSize, io.EOF
 }
 
-// выставить позицию окончания обработки потоков + поддержка отрицательных offset?
+
 func (cs *CombinedStream) Seek(offset int64, whence int) (int64, error) {
-	if cs.TotalSize() == 0 {
-		return -1, fmt.Errorf("error: no data in stream has been found")
+	if cs.totalSize == 0 {
+		if offset == 0 && (whence == io.SeekStart || whence == io.SeekEnd) {
+            return 0, nil
+        }
+
+		return 0, io.EOF 
 	}
+
+	var absPos int64
 	switch whence {
 	case seekStart:
-		for i := 0; i < len(cs.streams); i++ {
-			streamSize := cs.streams[i].TotalSize()
-			if streamSize > offset {
-				cs.indexCurrentStream = i
-				cs.currentPointer += offset
-				cs.streams[i].Seek(offset, seekStart)
-				break
-			} else {
-				cs.streams[i].Seek(streamSize, seekStart)
-				offset -= streamSize
-				cs.currentPointer += streamSize
-			}
-		}
+		absPos = offset
 	case seekCurrent:
-		var size int64
-		for i := 0; i < cs.indexCurrentStream; i++ {
-			size += cs.streams[i].TotalSize()
-		}
-		currentStreamOffset := cs.currentPointer - size
-		streamSize := cs.streams[cs.indexCurrentStream].TotalSize() - currentStreamOffset
-		for i := cs.indexCurrentStream + 1; i < len(cs.streams); i++ {			
-			if streamSize > offset {
-				cs.indexCurrentStream = i
-				cs.currentPointer = cs.currentPointer + offset
-				cs.streams[i].Seek(offset, seekCurrent)
-				break
-			} else {
-				offset -= streamSize
-				cs.streams[i].Seek(streamSize, seekStart)
-				cs.currentPointer += streamSize
-			}
-			streamSize = cs.streams[i].TotalSize()
-		}
-	case seekEnd:
-		cs.currentPointer = cs.TotalSize()
-		for i := len(cs.streams) - 1; i >= 0; i-- {
-			streamSize := cs.streams[i].TotalSize()
-			if streamSize > offset {
-				cs.indexCurrentStream = i
-				cs.currentPointer += streamSize + offset
-				cs.streams[i].Seek(offset, seekEnd)
-				break
-			} else {
-				offset += streamSize
-				cs.streams[i].Seek(streamSize, seekStart)
-				cs.currentPointer -= streamSize
-			}
-		}
-	default:
-		return 0, fmt.Errorf("invalid whence value")
+		absPos = cs.currentPointer + offset 
+	case seekEnd: 
+		absPos = cs.totalSize + offset 
+	default: 
+		return 0, fmt.Errorf("error: invalid whence")
 	}
-	if offset > 0 {
-		return cs.currentPointer, io.EOF
+
+	if absPos < 0 || absPos > cs.totalSize {
+		return 0, fmt.Errorf("invalid offset")
 	}
-	return cs.currentPointer, nil
+
+	var streamIndex int
+	var sumStreams int64
+
+	for {
+		if sumStreams > absPos {
+			break
+		}
+		sumStreams += cs.streams[streamIndex].TotalSize()
+		streamIndex++
+	}
+
+	sumStreams -= cs.streams[streamIndex].TotalSize()
+	localOffset := absPos - sumStreams
+
+	for i := 0; i < streamIndex; i++ {
+		_, err := cs.streams[i].Seek(0, seekEnd)
+		if err != nil {
+			return 0, fmt.Errorf("error while seeking stream")
+		}
+	}
+
+	_, err :=  cs.streams[streamIndex].Seek(localOffset, seekStart)
+	if err != nil {
+		return 0, fmt.Errorf("error while seeking stream")
+	}
+
+	for i := streamIndex + 1; i < len(cs.streams); i++ {
+		_, err = cs.streams[streamIndex].Seek(0, seekStart)
+		if err != nil {
+			return 0, fmt.Errorf("error while seeking stream")
+		}
+	}
+
+	cs.currentPointer = absPos
+	cs.indexCurrentStream = streamIndex
+
+	return absPos, nil
 }
 
 func (cs *CombinedStream) TotalSize() int64 {
