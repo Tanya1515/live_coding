@@ -2,9 +2,10 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"sync"
-	"time"
 )
 
 /*
@@ -31,6 +32,24 @@ Seek: должен в первую очередь перемещать курс�
 
 Close: должен обеспечивать корректное закрытие и освобождение всех ресурсов.
 
+Необходимо реализовать структуру CombinedStream, которая объединяет
+несколько объектов, реализующих интерфейс MeasuredStream.
+Структура CombinedStream должна сама реализовывать интерфейс MeasuredStream.
+
+Операции, которые должен поддерживать CombinedStream:
+
+Read:  должен читать данные последовательно из всех переданных потоков в том
+             же порядке, в котором они переданы в NewCombinedStream
+Seek:  должен позволять перемещать указатель на заданную позицию в объединенной
+            последовательности потоков.
+Close: должен закрыть все потоки.
+Size:  должен возвращать суммарный размер данных всех потоков.
+
+Здесь whence - аргумент, который определяет позицию относительно некоторой стартовой точки:
+1) io.SeekStart - позиция выставялется относительно начала потока
+2) io.SeekCurrent - позиция выставляется относительно текущей позиции
+3) io.SeekEnd - позиция выставялется относительно конца потока
+
 */
 
 const (
@@ -38,220 +57,188 @@ const (
 	seekCurrent
 	seekEnd
 )
-
+const bufferSize = 1024 * 1024
 type MeasuredStream interface {
 	io.ReadSeekCloser
 	TotalSize() int64
 }
 
 type CombinedStream struct {
-	streams            []MeasuredStream
-	buffer             []byte
-	mu                 *sync.Mutex
-	bufferPointer      int
-	bufferPointerWrite int
-	totalSize          int64
-	currentPointer     int64
-	indexStream        int
-	cond               *sync.Cond
-	stopChan           chan struct{}
+	streams        []MeasuredStream
+	buffer         []byte
+	bufferPointer  int64
+	totalSize      int64
+	currentPointer int64 // будет передвигаться в трем местах: Read, Seek и processBuffer
+	indexStream    int64
+	cond           *sync.Cond
+	stopChan       chan struct{}
 }
 
-const bufferSize = 1024 * 1024
-
 func (cs *CombinedStream) processBuffer() {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	cs.cond.L.Lock()
+	defer cs.cond.L.Unlock()
 	for {
+		cs.cond.Wait()
 		select {
 		case <-cs.stopChan:
 			return
-		case <-ticker.C:
-            cs.mu.Lock()
-            var diff int
-            if cs.bufferPointerWrite > cs.bufferPointer {
-                diff = cs.bufferPointerWrite - cs.bufferPointer 
-            } else {
-                diff = bufferSize - cs.bufferPointer
-                diff += cs.bufferPointerWrite
-            }
+		default:
+		}
 
-            i := cs.indexStream
-            amountRead := 0
-            for i < len(cs.streams) {
-                if diff >= 1024 {
-                    break
-                }
-                if cs.bufferPointerWrite > cs.bufferPointer {
-                    count, err:= cs.streams[i].Read(cs.buffer[cs.bufferPointerWrite:])
-                    if err == io.EOF {
-                        i += 1
-                    }
-                    cs.bufferPointerWrite += count
-                    diff += count
-                    amountRead += count
-                    if cs.bufferPointerWrite == bufferSize - 1 {
-                        cs.bufferPointerWrite = 0
-                    }
-                    if err != nil && err != io.EOF {
-                        break
-                    }
-                } else {
-                    count, err := cs.streams[i].Read(cs.buffer[cs.bufferPointerWrite:cs.bufferPointer])
-                    if err == io.EOF {
-                        i += 1
-                    }
-                    cs.bufferPointerWrite += count
-                    diff += count
-                    amountRead += count
-                    if err != nil && err != io.EOF {
-                        break
-                    }
-                }
-            }
-
-            cs.indexStream = i
-            cs.currentPointer += int64(amountRead)
-            cs.mu.Unlock()
+		processed := 0
+		for cs.indexStream < int64(len(cs.streams)) {
+			n, err := cs.streams[cs.indexStream].Read(cs.buffer[processed:])
+			processed += n
+			cs.currentPointer += int64(n)
+			if len(cs.buffer) == bufferSize {
+				break
+			}
+			if err == io.EOF {
+				cs.indexStream++
+				continue
+			}
+			if err != nil {
+				log.Println("error while reading from channel")
+			}
 		}
 	}
 }
 
 func NewCombinedStream(buffersNum int, rs ...MeasuredStream) *CombinedStream {
 	var size int64
-	stopChan := make(chan struct{})
-	buffer := make([]byte, bufferSize)
 
+	stopChan := make(chan struct{})
+
+	buffer := make([]byte, bufferSize)
+	
 	for _, stream := range rs {
 		size += stream.TotalSize()
 	}
-
-	return &CombinedStream{
+	mu := sync.Mutex{}
+	cond := sync.NewCond(&mu)
+	cs := &CombinedStream{
 		streams:   rs,
 		buffer:    buffer,
 		totalSize: size,
 		stopChan:  stopChan,
-		mu:        &sync.Mutex{},
+		cond:      cond,
 	}
+
+	go cs.processBuffer()
+	cs.cond.Signal()
+
+	return cs
 }
 
 func (cs *CombinedStream) Read(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, fmt.Errorf("buffer for reading is Empty")
+	}
+	if cs.TotalSize() == 0 {
+		return 0, io.EOF
+	}
 	processedSize := 0
-	readSize := len(p)
-	
+	cs.cond.L.Lock()
+	defer cs.cond.L.Unlock()
+	processedSize += copy(p, cs.buffer[cs.bufferPointer:])
+	cs.bufferPointer += int64(processedSize)
+	defer func() {
+		ok := false
+		cs.cond.L.Lock()
+		if cs.bufferPointer == bufferSize {
+			ok = true
+		}
+		cs.cond.L.Unlock()
+		if ok {
+			cs.cond.Signal()
+		}
+	}()
 	for {
-        cs.mu.Lock()
-		copiedCount := copy(p[processedSize:], cs.buffer[cs.bufferPointer:cs.bufferPointerWrite])
-		cs.bufferPointer += copiedCount
-        if cs.bufferPointer == bufferSize - 1 {
-            cs.bufferPointer = 0
-        }
-        if cs.indexStream == len(cs.streams) - 1 {
-            cs.mu.Unlock()
-            return processedSize, io.EOF
-        }
-        cs.mu.Unlock()
-		processedSize += copiedCount
-		if processedSize == readSize {
+		if cs.indexStream == int64(len(cs.streams)) {
 			break
 		}
-        time.Sleep(3 * time.Second)
-	}
-	
+		if processedSize == len(p) {
+			return processedSize, nil
+		}
 
-	return processedSize, nil
+		n, err := cs.streams[cs.indexStream].Read(p[processedSize:])
+		processedSize += n
+		cs.currentPointer += int64(n)
+		if err != nil {
+			if err == io.EOF {
+				cs.indexStream++
+				continue
+			}
+			return processedSize, fmt.Errorf("error while reading data from stream: %w", err)
+		}
+	}
+	return processedSize, io.EOF
 }
 
 func (cs *CombinedStream) Seek(offset int64, whence int) (int64, error) {
-    switch whence {
-    case seekStart: 
-        cs.mu.Lock()
-        cs.bufferPointer = 0
-        cs.bufferPointerWrite = 0
-        cs.currentPointer = 0
-        for i := 0; i < len(cs.streams); i++ {
-            if offset <= bufferSize {
-                count, _ := cs.streams[i].Read(cs.buffer[cs.bufferPointerWrite:])
-                cs.bufferPointerWrite += count
-            }
-            streamSize := cs.streams[i].TotalSize()
-			if streamSize > offset {
-                cs.currentPointer += offset
-				cs.indexStream = i
-				cs.streams[i].Seek(offset, seekCurrent)
-				break
-			} else {
-				offset -= streamSize
-				cs.streams[i].Seek(streamSize, seekStart)
-                cs.currentPointer += streamSize
-			}
-        }
-        cs.mu.Unlock()
-    case seekCurrent:
-        cs.mu.Lock()
-        cs.bufferPointer = 0
-        cs.bufferPointerWrite = 0
-        var size int64
-        for i := 0; i <= cs.indexStream; i++ {
-            size += cs.streams[i].TotalSize()
-        }
-        currentOffset := size - cs.currentPointer
-        streamSize := cs.streams[cs.indexStream].TotalSize() - currentOffset
-        for i := cs.indexStream; i < len(cs.streams); i++ {
-            if offset <= bufferSize {
-                count, _ := cs.streams[i].Read(cs.buffer[cs.bufferPointerWrite:])
-                cs.bufferPointerWrite += count
-            }
-            if streamSize > offset {
-                cs.currentPointer += offset
-				cs.indexStream = i
-				cs.streams[i].Seek(offset, seekCurrent)
-				break
-			} else {
-				offset -= streamSize
-				cs.streams[i].Seek(streamSize, seekStart)
-                cs.currentPointer += streamSize
-			}
-            streamSize = cs.streams[i].TotalSize()
-        }
-        cs.mu.Unlock()
-    case seekEnd:
-        cs.mu.Lock()
-        cs.bufferPointer = 0
-        cs.bufferPointerWrite = 0
-        cs.currentPointer = cs.TotalSize()
-        for i := len(cs.streams) - 1; i >= 0; i-- { 
-            streamSize := cs.streams[i].TotalSize()
-            currentOffset := offset * (-1)
-            if currentOffset <= bufferSize {
-                // проблема: читаем не с конца
-                count, _ := cs.streams[i].Read(cs.buffer[cs.bufferPointerWrite:])
-                cs.bufferPointerWrite += count
-            }
-            if streamSize > offset {
-				cs.indexStream = i
-                cs.currentPointer += offset 
-				cs.streams[i].Seek(offset, seekEnd)
-				break
-			} else {
-				offset += streamSize
-				cs.streams[i].Seek(streamSize, seekStart)
-				cs.currentPointer -= streamSize
-			}
-        }
+	if cs.totalSize == 0 {
+		if offset == 0 && (whence == io.SeekStart || whence == io.SeekEnd) {
+			return 0, nil
+		}
 
-        cs.mu.Unlock()
-    }
+		return 0, io.EOF
+	}
 
-    if offset > 0 {
-        return -1, io.EOF
-    }
+	cs.cond.L.Lock()
+	bufferSize := bufferSize - cs.bufferPointer + 1
+	var absPos int64
+	switch whence {
+	case seekStart:
+		absPos = offset
+	case seekCurrent:
+		absPos = cs.currentPointer - bufferSize + offset
+	case seekEnd:
+		absPos = cs.totalSize + offset
+	default:
+		return 0, fmt.Errorf("error: invalid whence")
+	}
+	if absPos < 0 || absPos > cs.totalSize {
+		return 0, fmt.Errorf("invalid offset")
+	}
+	var streamIndex int
+	var sumStreams int64
+	for {
+		if sumStreams > absPos {
+			break
+		}
+		sumStreams += cs.streams[streamIndex].TotalSize()
+		streamIndex++
+	}
+	sumStreams -= cs.streams[streamIndex].TotalSize()
+	localOffset := absPos - sumStreams
 
-    return cs.currentPointer, nil
+	for i := 0; i < streamIndex; i++ {
+		_, err := cs.streams[i].Seek(0, seekEnd)
+		if err != nil {
+			return 0, fmt.Errorf("error while seeking stream")
+		}
+	}
+	_, err := cs.streams[streamIndex].Seek(localOffset, seekStart)
+	if err != nil {
+		return 0, fmt.Errorf("error while seeking stream")
+	}
+	for i := streamIndex + 1; i < len(cs.streams); i++ {
+		_, err = cs.streams[streamIndex].Seek(0, seekStart)
+		if err != nil {
+			return 0, fmt.Errorf("error while seeking stream")
+		}
+	}
+	cs.currentPointer = absPos
+	cs.indexStream = int64(streamIndex)
+	cs.cond.L.Unlock()
+	cs.cond.Signal()
+	return absPos, nil
+
 }
 
 func (cs *CombinedStream) Close() error {
 	var resultError error
+	cs.cond.Signal()
 	close(cs.stopChan)
 	for _, stream := range cs.streams {
 		errCur := stream.Close()

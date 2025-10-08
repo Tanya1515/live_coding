@@ -1,353 +1,315 @@
-// Package asyncreader provides an asynchronous reader which reads
-// independently of write
-package asyncreader
+package main
 
 import (
-	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
-
-	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/lib/pool"
-	"github.com/rclone/rclone/lib/readers"
 )
 
-const (
-	// BufferSize is the default size of the async buffer
-	BufferSize       = pool.BufferSize
-	softStartInitial = 4 * 1024
-)
+const bufferSize = 1024 * 1024
 
-// ErrorStreamAbandoned is returned when the input is closed before the end of the stream
-var ErrorStreamAbandoned = errors.New("stream abandoned")
-
-// AsyncReader will do async read-ahead from the input reader
-// and make the data available as an io.Reader.
-// This should be fully transparent, except that once an error
-// has been returned from the Reader, it will not recover.
-type AsyncReader struct {
-	in      io.ReadCloser  // Input reader
-	ready   chan *buffer   // Buffers ready to be handed to the reader
-	token   chan struct{}  // Tokens which allow a buffer to be taken
-	exit    chan struct{}  // Closes when finished
-	buffers int            // Number of buffers
-	err     error          // If an error has occurred it is here
-	cur     *buffer        // Current buffer being served
-	exited  chan struct{}  // Channel is closed been the async reader shuts down
-	size    int            // size of buffer to use
-	closed  bool           // whether we have closed the underlying stream
-	mu      sync.Mutex     // lock for Read/WriteTo/Abandon/Close
-	ci      *fs.ConfigInfo // for reading config
-	pool    *pool.Pool     // pool to get memory from
+type MeasuredStream interface {
+	io.ReadSeekCloser
+	TotalSize() int64
 }
 
-// New returns a reader that will asynchronously read from
-// the supplied Reader into a number of buffers each of size BufferSize
-// It will start reading from the input at once, maybe even before this
-// function has returned.
-// The input can be read from the returned reader.
-// When done use Close to release the buffers and close the supplied input.
-func New(ctx context.Context, rd io.ReadCloser, buffers int) (*AsyncReader, error) {
-	if buffers <= 0 {
-		return nil, errors.New("number of buffers too small")
-	}
-	if rd == nil {
-		return nil, errors.New("nil reader supplied")
-	}
-	a := &AsyncReader{
-		ci:   fs.GetConfig(ctx),
-		pool: pool.Global(),
-	}
-	a.init(rd, buffers)
-	return a, nil
+// Структура для хранения буфера
+type BufferItem struct {
+	start int64
+	data  []byte
 }
 
-func (a *AsyncReader) init(rd io.ReadCloser, buffers int) {
-	a.in = rd
-	a.ready = make(chan *buffer, buffers)
-	a.token = make(chan struct{}, buffers)
-	a.exit = make(chan struct{})
-	a.exited = make(chan struct{})
-	a.buffers = buffers
-	a.cur = nil
-	a.size = softStartInitial
+type CombinedStream struct {
+	streams     []MeasuredStream // все соединенные потоки
+	queue       []*BufferItem    // очередь префетченных буферов
+	currentBuf  *BufferItem      // текущий буфер для чтения
+	bufPointer  int              // позиция в currentBuf.data
+	totalSize   int64
+	currentPos  int64 // глобальная позиция
+	indexStream int   // текущий индекс stream-а для префетча
+	prefetchPos int64 // следующая позиция для префетча
+	done        bool
+	err         error      // ошибка
+	cond        *sync.Cond // для синхронизации
+	stopChan    chan struct{}
+}
 
-	// Create tokens
-	for range buffers {
-		a.token <- struct{}{}
+func NewCombinedStream(buffersNum int, rs ...MeasuredStream) *CombinedStream {
+	var size int64
+	stopChan := make(chan struct{})
+
+	// считаем сумму всех stream-ов
+	for _, stream := range rs {
+		size += stream.TotalSize()
 	}
+	mu := sync.Mutex{}
+	cond := sync.NewCond(&mu)
+	cs := &CombinedStream{
+		streams:   rs,
+		queue:     make([]*BufferItem, 0, buffersNum),
+		totalSize: size,
+		stopChan:  stopChan,
+		cond:      cond,
+	}
+	// Инициализация позиций в стримах
+	cs.resetSeeks(0, 0)
+	// запускаем горутину для асихронного prefetch-а
+	go cs.processBuffer(buffersNum)
+	return cs
+}
 
-	// Start async reader
-	go func() {
-		// Ensure that when we exit this is signalled.
-		defer close(a.exited)
-		defer close(a.ready)
-		for {
-			select {
-			case <-a.token:
-				b := a.getBuffer()
-				if a.size < BufferSize {
-					b.buf = b.buf[:a.size]
-					a.size <<= 1
-				}
-				err := b.read(a.in)
-				a.ready <- b
-				if err != nil {
-					return
-				}
-			case <-a.exit:
-				return
-			}
+// функция, которая смещает указатель в stream-ах относительно текущего индекса
+// если i < streamIndex - сдвигаем в конец
+// если i = streamIndex - сдвигаем на текущий localOffset
+// если i > streamIndex - сдвигаем в конец
+// Таким образом, выравниваем все позиции
+func (cs *CombinedStream) resetSeeks(streamIndex int, localOffset int64) error {
+	for i := 0; i < len(cs.streams); i++ {
+		var off int64
+		var wh int
+		if i < streamIndex {
+			off = 0
+			wh = io.SeekEnd
+		} else if i == streamIndex {
+			off = localOffset
+			wh = io.SeekStart
+		} else {
+			off = 0
+			wh = io.SeekStart
 		}
-	}()
-}
-
-// return the buffer to the pool (clearing it)
-func (a *AsyncReader) putBuffer(b *buffer) {
-	a.pool.Put(b.buf)
-	b.buf = nil
-}
-
-// get a buffer from the pool
-func (a *AsyncReader) getBuffer() *buffer {
-	return &buffer{
-		buf: a.pool.Get(),
-	}
-}
-
-// Read will return the next available data.
-func (a *AsyncReader) fill() (err error) {
-	if a.cur.isEmpty() {
-		if a.cur != nil {
-			a.putBuffer(a.cur)
-			a.token <- struct{}{}
-			a.cur = nil
+		_, err := cs.streams[i].Seek(off, wh)
+		if err != nil {
+			return err
 		}
-		b, ok := <-a.ready
-		if !ok {
-			// Return an error to show fill failed
-			if a.err == nil {
-				return ErrorStreamAbandoned
-			}
-			return a.err
-		}
-		a.cur = b
 	}
 	return nil
 }
 
-// Read will return the next available data.
-func (a *AsyncReader) Read(p []byte) (n int, err error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	// Swap buffer and maybe return error
-	err = a.fill()
-	if err != nil {
-		return 0, err
-	}
-
-	// Copy what we can
-	n = copy(p, a.cur.buffer())
-	a.cur.increment(n)
-
-	// If at end of buffer, return any error, if present
-	if a.cur.isEmpty() {
-		a.err = a.cur.err
-		return n, a.err
-	}
-	return n, nil
-}
-
-// WriteTo writes data to w until there's no more data to write or when an error occurs.
-// The return value n is the number of bytes written.
-// Any error encountered during the write is also returned.
-func (a *AsyncReader) WriteTo(w io.Writer) (n int64, err error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	n = 0
+func (cs *CombinedStream) processBuffer(buffersNum int) {
+	cs.cond.L.Lock()
+	defer cs.cond.L.Unlock()
 	for {
-		err = a.fill()
-		if err == io.EOF {
-			return n, nil
-		}
-		if err != nil {
-			return n, err
-		}
-		n2, err := w.Write(a.cur.buffer())
-		a.cur.increment(n2)
-		n += int64(n2)
-		if err != nil {
-			return n, err
-		}
-		if a.cur.err == io.EOF {
-			a.err = a.cur.err
-			return n, err
-		}
-		if a.cur.err != nil {
-			a.err = a.cur.err
-			return n, a.cur.err
-		}
-	}
-}
-
-// SkipBytes will try to seek 'skip' bytes relative to the current position.
-// On success it returns true. If 'skip' is outside the current buffer data or
-// an error occurs, Abandon is called and false is returned.
-func (a *AsyncReader) SkipBytes(skip int) (ok bool) {
-	a.mu.Lock()
-	defer func() {
-		a.mu.Unlock()
-		if !ok {
-			a.Abandon()
-		}
-	}()
-
-	if a.err != nil {
-		return false
-	}
-	if skip < 0 {
-		// seek backwards if skip is inside current buffer
-		if a.cur != nil && a.cur.offset+skip >= 0 {
-			a.cur.offset += skip
-			return true
-		}
-		return false
-	}
-	// early return if skip is past the maximum buffer capacity
-	if skip >= (len(a.ready)+1)*BufferSize {
-		return false
-	}
-
-	refillTokens := 0
-	for {
-		if a.cur.isEmpty() {
-			if a.cur != nil {
-				a.putBuffer(a.cur)
-				refillTokens++
-				a.cur = nil
-			}
-			select {
-			case b, ok := <-a.ready:
-				if !ok {
-					return false
+		for len(cs.queue) < buffersNum && !cs.done && cs.err == nil {
+			buf := make([]byte, bufferSize)
+			processed := 0
+			// пока буфер не заполнен до конца и пока не закончили читать все потоки
+			// и пока не встретили ошибки
+			for processed < bufferSize && cs.indexStream < len(cs.streams) && cs.err == nil {
+				n, err := cs.streams[cs.indexStream].Read(buf[processed:])
+				processed += n
+				if err != nil {
+					if err == io.EOF {
+						cs.indexStream++
+						continue
+					}
+					cs.err = err
 				}
-				a.cur = b
-			default:
-				return false
+			}
+			// если возникла ошибка при чтении stream-ов - завершаем горутину.
+			if cs.err != nil {
+				return
+			}
+			// если что-то записано в буфере, то добавляем записанные
+			// данные в очередь буферов
+			if processed > 0 {
+				item := &BufferItem{
+					start: cs.prefetchPos,
+					data:  buf[:processed],
+				}
+				cs.queue = append(cs.queue, item)
+				cs.prefetchPos += int64(processed)
+			}
+			// если индекс текущего stream-а больше или равен количеству всех stream-ов
+			// то выставляем флаг, что все данные прочитаны и оповещаем все остальные горутины
+			if processed < bufferSize && cs.indexStream >= len(cs.streams) {
+				cs.done = true
 			}
 		}
-
-		n := min(len(a.cur.buffer()), skip)
-		a.cur.increment(n)
-		skip -= n
-		if skip == 0 {
-			for ; refillTokens > 0; refillTokens-- {
-				a.token <- struct{}{}
-			}
-			// If at end of buffer, store any error, if present
-			if a.cur.isEmpty() && a.cur.err != nil {
-				a.err = a.cur.err
-			}
-			return true
+		select {
+		case <-cs.stopChan:
+			return
+		default:
 		}
-		if a.cur.err != nil {
-			a.err = a.cur.err
-			return false
-		}
+		// ждём сигнал, что queue full или сигнал от Seek/Read и затем проверяем,
+		// что количество буферов не превосходит ранее заданной buffersNum
+		// и сам канал не закончился
+		cs.cond.Wait()
 	}
 }
 
-// StopBuffering will ensure that the underlying async reader is shut
-// down so no more is read from the input.
-//
-// This does not free the memory so Abandon() or Close() need to be
-// called on the input.
-//
-// This does not wait for Read/WriteTo to complete so can be called
-// concurrently to those.
-func (a *AsyncReader) StopBuffering() {
-	select {
-	case <-a.exit:
-		// Do nothing if reader routine already exited
-		return
+func (cs *CombinedStream) Read(p []byte) (n int, err error) {
+	// проверяем, что размер буфера не нулевой
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	// проверяем, что размер всех каналов не нулевой
+	if cs.totalSize == 0 {
+		return 0, io.EOF
+	}
+
+	cs.cond.L.Lock()
+	defer cs.cond.L.Unlock()
+
+	processed := 0
+	for processed < len(p) {
+		// проверяем что текущий буфер не выставлен или указатель на текущем
+		// буфере превосходит размер данных в текущем буфере
+		if cs.currentBuf == nil || cs.bufPointer >= len(cs.currentBuf.data) {
+			if len(cs.queue) > 0 {
+				// Выставляем текущий буфер
+				cs.currentBuf = cs.queue[0]
+				// Обрезаем очередь буферов
+				cs.queue = cs.queue[1:]
+				// Выставляем указатель6 откуда читать из текущего буфера на 0-ую позицию
+				// (то есть будем читать сначала)
+				cs.bufPointer = 0
+				cs.cond.Signal() // сигналим, что место в queue освободилось
+			} else {
+				// Нет префетча — читаем напрямую из стримов
+				// Проверяем, что еще есть, что читать из stream-ов (то есть они не закончились)
+				if cs.done || cs.indexStream >= len(cs.streams) {
+					if processed == 0 {
+						return 0, io.EOF
+					}
+					return processed, io.EOF
+				}
+				// проверяем, что в stream-ах нет ошибки
+				if cs.err != nil {
+					return processed, cs.err
+				}
+				// считываем данные из текущего stream-а
+				nDirect, errDirect := cs.streams[cs.indexStream].Read(p[processed:])
+				// сдвигаем processed и указатель на прочитанное количество байт
+				processed += nDirect
+				cs.currentPos += int64(nDirect)
+				// проверяем, что не было ошибки при считывании из sstream-ов
+				if errDirect != nil {
+					// если stream просто закончился - увеличиваем счетчик текущих stream-ов
+					if errDirect == io.EOF {
+						cs.indexStream++
+						continue
+					}
+					// если реальная ошибка - записываем ее и выходим из операции Read
+					cs.err = errDirect
+					return processed, fmt.Errorf("error while reading data from stream: %w", errDirect)
+				}
+			}
+		}
+		// выбираем минимальное количество байт: которое либо можно скопировать из
+		// буфера, либо оставшееся количество байт в stream-е
+		copyAmt := min(len(p)-processed, len(cs.currentBuf.data)-cs.bufPointer)
+		// копируем данные от текущего указателя до copyAmt
+		copy(p[processed:processed+copyAmt], cs.currentBuf.data[cs.bufPointer:cs.bufPointer+copyAmt])
+		// увеличиваем указатели на текущее количество байт в буфере, в смерженных stream-ах,
+		// в буфере, куда необходимо скопировать данные
+		processed += copyAmt
+		cs.bufPointer += copyAmt
+		cs.currentPos += int64(copyAmt)
+	}
+	return processed, nil
+}
+
+func (cs *CombinedStream) Seek(offset int64, whence int) (int64, error) {
+	cs.cond.L.Lock()
+	defer cs.cond.L.Unlock()
+	var absPos int64
+
+	// Проверяем, что пришла корректная стартовая позиция и
+	// относительно этой позиции вычисляем итоговую позицию в stream-е
+	switch whence {
+	case io.SeekStart:
+		absPos = offset
+	case io.SeekCurrent:
+		absPos = cs.currentPos + offset
+	case io.SeekEnd:
+		absPos = cs.totalSize + offset
 	default:
+		return 0, fmt.Errorf("error: invalid whence")
 	}
-	// Close and wait for go routine
-	close(a.exit)
-	<-a.exited
-}
 
-// Abandon will ensure that the underlying async reader is shut down
-// and memory is returned. It does everything but close the input.
-//
-// It will NOT close the input supplied on New.
-func (a *AsyncReader) Abandon() {
-	a.StopBuffering()
-	// take the lock to wait for Read/WriteTo to complete
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	// Return any outstanding buffers to the Pool
-	if a.cur != nil {
-		a.putBuffer(a.cur)
-		a.cur = nil
+	// проверяем, что итоговая позиция находится в корректном интервале
+	if absPos < 0 || absPos > cs.totalSize {
+		return 0, fmt.Errorf("invalid offset")
 	}
-	for b := range a.ready {
-		a.putBuffer(b)
+	// проверяем общий размер stream-ов
+	if cs.totalSize == 0 {
+		cs.currentPos = 0
+		return 0, nil
 	}
-}
 
-// Close will ensure that the underlying async reader is shut down.
-// It will also close the input supplied on New.
-func (a *AsyncReader) Close() (err error) {
-	a.Abandon()
-	if a.closed {
-		return nil
+	// Проверка, что итоговая позиция попадает в текущий буфер
+	if cs.currentBuf != nil && cs.currentBuf.start <= absPos && absPos < cs.currentBuf.start+int64(len(cs.currentBuf.data)) {
+		cs.bufPointer = int(absPos - cs.currentBuf.start)
+		cs.currentPos = absPos
+		cs.cond.Signal()
+		return absPos, nil
 	}
-	a.closed = true
-	return a.in.Close()
-}
 
-// Internal buffer
-// If an error is present, it must be returned
-// once all buffer content has been served.
-type buffer struct {
-	buf    []byte
-	err    error
-	offset int
-}
-
-// isEmpty returns true is offset is at end of
-// buffer, or
-func (b *buffer) isEmpty() bool {
-	if b == nil {
-		return true
+	// Проверка в queue
+	for i, item := range cs.queue {
+		// absPos попадает в интервал конкретного буфера, првоеряем item.start,
+		// который является позицией для следующего prefetch
+		if item.start <= absPos && absPos < item.start+int64(len(item.data)) {
+			cs.currentBuf = item
+			cs.bufPointer = int(absPos - item.start)
+			cs.queue = cs.queue[i+1:] // обрезаем очередь буферов
+			cs.currentPos = absPos
+			cs.cond.Signal() // место освободилось
+			return absPos, nil
+		}
 	}
-	if len(b.buf)-b.offset <= 0 {
-		return true
+
+	// Если в буфере места недостаточно - выходим и начинаем итерироваться по оставшимся stream-ам
+	cs.queue = cs.queue[:0]
+	cs.currentBuf = nil
+	cs.bufPointer = 0
+	var sumPrev int64
+	cs.indexStream = 0
+	for cs.indexStream < len(cs.streams) {
+		if sumPrev+cs.streams[cs.indexStream].TotalSize() > absPos {
+			break
+		}
+		sumPrev += cs.streams[cs.indexStream].TotalSize()
+		cs.indexStream++
 	}
-	return false
+
+	localOffset := absPos - sumPrev
+
+	err := cs.resetSeeks(cs.indexStream, localOffset)
+	if err != nil {
+		return 0, fmt.Errorf("error while seeking stream: %w", err)
+	}
+
+	cs.prefetchPos = absPos
+	cs.done = false
+	cs.err = nil
+	cs.cond.Signal() // перезапускаем префетч
+	cs.currentPos = absPos
+	return absPos, nil
 }
 
-// read into start of the buffer from the supplied reader,
-// resets the offset and updates the size of the buffer.
-// Any error encountered during the read is returned.
-func (b *buffer) read(rd io.Reader) error {
-	var n int
-	n, b.err = readers.ReadFill(rd, b.buf)
-	b.buf = b.buf[0:n]
-	b.offset = 0
-	return b.err
+func (cs *CombinedStream) Close() error {
+	var resultError error
+	cs.cond.L.Lock()
+	cs.cond.Broadcast()
+	cs.cond.L.Unlock()
+	close(cs.stopChan)
+	for _, stream := range cs.streams {
+		errCur := stream.Close()
+		resultError = errors.Join(resultError, errCur)
+	}
+	return resultError
 }
 
-// Return the buffer at current offset
-func (b *buffer) buffer() []byte {
-	return b.buf[b.offset:]
+func (cs *CombinedStream) TotalSize() int64 {
+	return cs.totalSize
 }
 
-// increment the offset
-func (b *buffer) increment(n int) {
-	b.offset += n
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
